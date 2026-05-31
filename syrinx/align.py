@@ -308,13 +308,20 @@ def _make_aligner(substitution: dict[str, Any]) -> Any:
     primary_matrix = substitution["primary_matrix"]
     letters = [cluster_letters[lb] for lb in label_order]
 
-    sub_dict: dict[tuple[str, str], float] = {}
-    for i, li in enumerate(letters):
-        for j, lj in enumerate(letters):
-            sub_dict[(li, lj)] = float(primary_matrix[i, j])
-            sub_dict[(lj, li)] = float(primary_matrix[i, j])
+    # Build as 2-D ndarray — substitution_matrices.Array requires alphabet as str or tuple.
+    n = len(letters)
+    array_2d = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            array_2d[i, j] = float(primary_matrix[i, j])
 
-    aligner.substitution_matrix = substitution_matrices.Array(letters, 2, data=sub_dict)
+    # Single-char alphabet → str; multi-char → tuple (for >26 cluster vocabularies)
+    if all(len(lt) == 1 for lt in letters):
+        alphabet: str | tuple = "".join(letters)
+    else:
+        alphabet = tuple(letters)
+
+    aligner.substitution_matrix = substitution_matrices.Array(alphabet, 2, data=array_2d)
     return aligner
 
 

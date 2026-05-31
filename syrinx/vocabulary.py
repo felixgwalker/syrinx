@@ -97,8 +97,19 @@ def build_vocabulary(
             )
             grid = _coarsen_grid(grid)
 
-        # Build centroids
+        # Build centroids — guard against all-noise result
         unique_labels = sorted(set(best_labels) - {-1})
+        if not unique_labels:
+            logger.warning("Cycle %d: HDBSCAN found no clusters; adjusting grid", cycle + 1)
+            grid = _coarsen_grid(grid)
+            cycle_diagnostics.append({
+                "cycle": cycle,
+                "params": {"min_cluster_size": best_params[0], "min_samples": best_params[1]},
+                "dbcv": float(best_dbcv),
+                "zf_f1": None,
+                "gate_results": {"error": "no_clusters"},
+            })
+            continue
         centroids = np.vstack([X[best_labels == lb].mean(axis=0) for lb in unique_labels])
 
         # Run 4 gates
@@ -146,6 +157,19 @@ def build_vocabulary(
             )
 
     unique_labels = sorted(set(best_labels) - {-1})
+    if not unique_labels:
+        diag = {
+            "error": "VocabularyValidationError",
+            "cycles": cycle_diagnostics,
+            "n_cycles": cfg.hdbscan_max_cycles,
+            "note": "no clusters found in any cycle",
+        }
+        save_manifest(diag, cfg.data_path / "manifests" / "vocabulary_failure.json")
+        raise VocabularyValidationError(
+            f"No vocabulary parameter combination passed all 4 gates after "
+            f"{cfg.hdbscan_max_cycles} cycles",
+            diag,
+        )
     centroids = np.vstack([X[best_labels == lb].mean(axis=0) for lb in unique_labels])
     cluster_letters = _assign_letters(centroids, unique_labels)
     noise_fraction = float((best_labels == -1).mean())
@@ -312,7 +336,11 @@ def _gate2_cross_recordist(
     syllables: list[dict[str, Any]],
     cfg: Config,
 ) -> dict[str, Any]:
-    """Gate 2: Cross-recordist consistency (mean pairwise ARI ≥ threshold).
+    """Gate 2: Cross-recordist consistency (mean per-recordist ARI ≥ threshold).
+
+    For each recordist, re-cluster their syllable subset independently, then
+    compute ARI between those per-recordist labels and the full-data labels for
+    the same subset.  Averaging across recordists gives a consistency score.
 
     Parameters
     ----------
@@ -326,48 +354,53 @@ def _gate2_cross_recordist(
         Pipeline configuration.
     """
     import hdbscan
-    from scipy.stats import permutation_test
 
     recordists = [s.get("recordist_id", "") for s in syllables]
     unique_rec = sorted(set(r for r in recordists if r))
     if len(unique_rec) < 2:
         logger.info("Gate 2: fewer than 2 recordists; auto-passing")
-        return {"value": 1.0, "threshold": cfg.cross_recordist_ari_threshold, "passed": True, "note": "fewer than 2 recordists"}
+        return {
+            "value": 1.0,
+            "threshold": cfg.cross_recordist_ari_threshold,
+            "passed": True,
+            "note": "fewer than 2 recordists",
+        }
 
+    n_clusters_est = len(set(labels) - {-1})
     params = _get_params_from_labels(labels, X)
-    per_rec_labels = {}
+    aris: list[float] = []
+
     for rec_id in unique_rec:
-        idx = [i for i, r in enumerate(recordists) if r == rec_id]
-        if len(idx) < params[0]:
+        idx = np.array([i for i, r in enumerate(recordists) if r == rec_id])
+        # Scale min_cluster_size to subset size so clusters are still detectable
+        subset_min_cs = max(3, len(idx) // max(1, n_clusters_est * 3))
+        if len(idx) < subset_min_cs:
             continue
         X_sub = X[idx]
         try:
-            c = hdbscan.HDBSCAN(min_cluster_size=params[0], min_samples=params[1])
-            per_rec_labels[rec_id] = (idx, c.fit_predict(X_sub))
+            c = hdbscan.HDBSCAN(
+                min_cluster_size=subset_min_cs,
+                min_samples=max(2, min(params[1], subset_min_cs)),
+            )
+            rec_labels = c.fit_predict(X_sub)
+            full_sub = labels[idx]
+            ari = adjusted_rand_score(full_sub, rec_labels)
+            aris.append(ari)
         except Exception:
             pass
 
-    if len(per_rec_labels) < 2:
-        return {"value": 0.0, "threshold": cfg.cross_recordist_ari_threshold, "passed": False, "note": "insufficient recordists after filtering"}
+    if len(aris) < 2:
+        return {
+            "value": 0.0,
+            "threshold": cfg.cross_recordist_ari_threshold,
+            "passed": False,
+            "note": "insufficient recordists with enough syllables",
+        }
 
-    aris = []
-    rec_ids = sorted(per_rec_labels.keys())
-    for i in range(len(rec_ids)):
-        for j in range(i + 1, len(rec_ids)):
-            idx_i, lab_i = per_rec_labels[rec_ids[i]]
-            idx_j, lab_j = per_rec_labels[rec_ids[j]]
-            # Use full-data labels for shared indices
-            shared = list(set(idx_i) & set(idx_j))
-            if not shared:
-                continue
-            full_i = labels[shared]
-            full_j = labels[shared]
-            aris.append(adjusted_rand_score(full_i, full_j))
-
-    mean_ari = float(np.mean(aris)) if aris else 0.0
+    mean_ari = float(np.mean(aris))
     threshold = cfg.cross_recordist_ari_threshold
 
-    # One-sided permutation test against random assignment null
+    # One-sided permutation test: is mean_ari above the random-assignment null?
     rng = np.random.RandomState(cfg.random_seed)
     null_aris = [
         adjusted_rand_score(labels, rng.permutation(labels))
@@ -381,7 +414,7 @@ def _gate2_cross_recordist(
         "threshold": threshold,
         "p_value": p_value,
         "passed": passed,
-        "n_recordist_pairs": len(aris),
+        "n_recordists": len(aris),
     }
 
 

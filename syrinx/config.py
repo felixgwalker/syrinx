@@ -61,6 +61,11 @@ class Config:
     output_dir: str
 
     # Optional fields with defaults
+    # Preregistered feature aggregation (see RR §2.9.1 and RR-AMBIGUITY resolution 2026-05-31).
+    # "mean" is the only reading consistent with stated 30/36-dim counts; do not change without
+    # updating mfcc_feature_dim, pitch_amplitude_dim, and all downstream dimension constants.
+    cepstral_aggregation: str = "mean"
+
     xc_query_genus: str = "gen:Phylloscopus type:song q:A"
     xc_query_within_species: str = "Phylloscopus trochilus cnt:United+Kingdom type:song q:A"
     xc_within_species_lat_min: float = 49.9
@@ -169,6 +174,14 @@ def load_config(path: str | Path = "config.yaml") -> Config:
 
 
 def _validate(cfg: Config) -> None:
+    if cfg.cepstral_aggregation not in ("mean", "mean_sd"):
+        raise ValueError("cepstral_aggregation must be 'mean' or 'mean_sd'")
+    if cfg.cepstral_aggregation == "mean_sd" and cfg.mfcc_feature_dim == 30:
+        raise ValueError(
+            "cepstral_aggregation='mean_sd' yields >30 cepstral dims; "
+            "update mfcc_feature_dim before using this mode. "
+            "RR-NOTE: mean_sd is not the preregistered primary analysis setting."
+        )
     if cfg.bonferroni_alpha <= 0 or cfg.bonferroni_alpha >= 1:
         raise ValueError("bonferroni_alpha must be in (0, 1)")
     if cfg.null_model_upper_tail <= 0.5 or cfg.null_model_upper_tail >= 1:

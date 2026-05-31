@@ -187,6 +187,10 @@ def _compute_mfcc_features(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute MFCC + delta features, returning (30-dim aggregate, temporal matrix).
 
+    Preregistered aggregation (cepstral_aggregation='mean', RR §2.9.1):
+        13 MFCC means + 13 delta means + 4 spectral means = 30 dims.
+    This is the only reading consistent with the RR's stated 30/36-dim counts.
+
     Parameters
     ----------
     y:
@@ -204,7 +208,7 @@ def _compute_mfcc_features(
     -------
     tuple[np.ndarray, np.ndarray]
         ``(mfcc_vec, temporal_matrix)`` where ``mfcc_vec`` is shape ``(30,)``
-        and ``temporal_matrix`` is shape ``(26, T)`` with zero-padding.
+        and ``temporal_matrix`` is shape ``(26, T)`` with zero-padding/truncation.
     """
     import librosa
 
@@ -223,22 +227,13 @@ def _compute_mfcc_features(
     # Stack mfcc + delta → (26 × T) for temporal mode
     mfcc_delta_stack = np.vstack([mfcc, delta])  # (26, T)
 
-    # 30-dim aggregate: [mean(mfcc), std(mfcc), mean(delta), std(delta),
-    #                    mean(centroid), std(centroid), mean(bandwidth), std(bandwidth),
-    #                    mean(rolloff), std(rolloff), mean(zcr), std(zcr)]
-    # = 13*2 + 4 = 30
-    parts = [
-        mfcc.mean(axis=1),    # 13
-        mfcc.std(axis=1),     # 13
-        # replace last 4 with spectral summaries (mean+std of 2)
-    ]
+    # 30-dim aggregate (mean-only): 13 MFCC means + 13 delta means + 4 spectral means = 30
     spectral_means = np.array([
         centroid.mean(), bandwidth.mean(), rolloff.mean(), zcr.mean(),
     ])
-    # Total: 13 + 13 + 4 = 30
     mfcc_vec = np.concatenate([
         mfcc.mean(axis=1),    # 13
-        mfcc.std(axis=1),     # 13
+        delta.mean(axis=1),   # 13
         spectral_means,       # 4
     ])
 

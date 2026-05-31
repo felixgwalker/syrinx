@@ -59,6 +59,10 @@ hop_length_ms: 10
 spectral_rolloff_threshold: 0.85
 mfcc_feature_dim: 30
 pitch_amplitude_dim: 6
+# Preregistered feature aggregation — see RR §2.9.1.
+# mean: 13 MFCC means + 13 delta means + 4 spectral means = 30 dims (consistent with stated 30/36 counts).
+# mean_sd: would yield ≠30 dims and requires updating all downstream dimension constants — NOT the RR default.
+cepstral_aggregation: "mean"
 
 # Temporal mode MFCC
 temporal_n_frames: 50
