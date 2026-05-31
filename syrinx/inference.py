@@ -72,7 +72,7 @@ def run_inference(
     result: dict[str, Any] = {}
 
     if dataset in ("genus", "both"):
-        result["h1"] = _run_h1(cfg, alignment_result, species_metadata, run_log)
+        result["h1"] = _run_h1(cfg, alignment_result, species_metadata, run_log, molecular_tree)
     if dataset in ("within_species", "both"):
         result["h2"] = _run_h2(cfg, descriptive_result, run_log)
         result["h3"] = _run_h3(cfg, alignment_result, run_log)
@@ -135,8 +135,9 @@ def _run_h1(
     alignment_result: dict[str, Any],
     species_metadata: list[dict[str, Any]],
     run_log: Any,
+    molecular_tree: Any = None,
 ) -> dict[str, Any]:
-    """Run H1 MRM analysis.
+    """Run H1 MRM analysis and complementary PGLS.
 
     Parameters
     ----------
@@ -148,6 +149,8 @@ def _run_h1(
         Per-species metadata with lat/lon.
     run_log:
         Optional PipelineRunLog.
+    molecular_tree:
+        Bio.Phylo molecular reference tree, or None.
     """
     D_acoustic = alignment_result["distance_matrix"]
     species_names = alignment_result["species_names"]
@@ -198,8 +201,12 @@ def _run_h1(
         statistically_sig, biologically_meaningful, cfg.h1_biological_threshold_semipartial_r2, spr2, "semi-partial r²"
     )
 
+    # Complementary PGLS (secondary, α = 0.05 uncorrected)
+    pgls_result = _run_pgls_r(species_names, D_acoustic, D_geo, molecular_tree, cfg)
+
     result = {
         "mrm": mrm_result,
+        "pgls": pgls_result,
         "mantel_pearson": mantel_pearson,
         "mantel_spearman": mantel_spearman,
         "mantel_geographic": mantel_geo,
@@ -396,6 +403,127 @@ def _run_partial_mantel_r(
     except Exception as exc:
         logger.warning("Partial Mantel via rpy2 failed: %s", exc)
         return {"error": str(exc)}
+
+
+def _run_pgls_r(
+    species_names: list[str],
+    D_acoustic: np.ndarray,
+    D_geo: np.ndarray,
+    molecular_tree: Any,
+    cfg: Config,
+) -> dict[str, Any]:
+    """Secondary PGLS via caper: mean acoustic distance ~ mean geographic distance.
+
+    Uses Pagel's λ estimated by ML. Reports slope, SE, t, p, and λ.
+    α = 0.05 uncorrected (preregistered secondary analysis).
+
+    Parameters
+    ----------
+    species_names:
+        Ordered species labels matching rows/columns of the distance matrices.
+    D_acoustic:
+        n×n acoustic distance matrix.
+    D_geo:
+        n×n great-circle geographic distance matrix.
+    molecular_tree:
+        Bio.Phylo molecular reference tree, or None.
+    cfg:
+        Pipeline configuration.
+    """
+    if molecular_tree is None:
+        return {"error": "no molecular tree provided for PGLS"}
+
+    n = len(species_names)
+    if n < 4:
+        return {"error": f"too few species for PGLS (n={n})"}
+
+    # Per-species means across all other species (off-diagonal)
+    D_ac = D_acoustic.copy().astype(float)
+    D_ge = D_geo.copy().astype(float)
+    np.fill_diagonal(D_ac, np.nan)
+    np.fill_diagonal(D_ge, np.nan)
+    acoustic_means = np.nanmean(D_ac, axis=1)
+    geo_means = np.nanmean(D_ge, axis=1)
+
+    try:
+        import io
+        import rpy2.robjects as ro
+        from rpy2.robjects import numpy2ri
+        from rpy2.robjects.packages import importr
+        from Bio import Phylo
+
+        numpy2ri.activate()
+        ape = importr("ape")
+        caper = importr("caper")
+        base = importr("base")
+
+        # Serialise Bio.Phylo tree → Newick string
+        buf = io.StringIO()
+        Phylo.write(molecular_tree, buf, "newick")
+        newick_str = buf.getvalue().strip()
+
+        # Push data into R global environment with a unique prefix
+        ro.globalenv["_syrinx_species"] = ro.StrVector(species_names)
+        ro.globalenv["_syrinx_acoustic"] = ro.FloatVector(acoustic_means.tolist())
+        ro.globalenv["_syrinx_geo"] = ro.FloatVector(geo_means.tolist())
+        ro.globalenv["_syrinx_newick"] = ro.StrVector([newick_str])
+
+        ro.r("""
+            .syrinx_tree <- ape::read.tree(text = `_syrinx_newick`)
+            .syrinx_df <- data.frame(
+                species  = `_syrinx_species`,
+                acoustic = `_syrinx_acoustic`,
+                geo      = `_syrinx_geo`,
+                stringsAsFactors = FALSE
+            )
+            .syrinx_cdat <- caper::comparative.data(
+                phy       = .syrinx_tree,
+                data      = .syrinx_df,
+                names.col = "species",
+                warn.dropped = FALSE
+            )
+            .syrinx_pgls  <- caper::pgls(acoustic ~ geo, data = .syrinx_cdat, lambda = "ML")
+            .syrinx_summ  <- summary(.syrinx_pgls)
+            .syrinx_coef  <- coef(.syrinx_summ)
+            .syrinx_lam   <- .syrinx_pgls$param[["lambda"]]
+        """)
+
+        coef_matrix = np.array(ro.r[".syrinx_coef"])
+        lambda_val = float(ro.r[".syrinx_lam"][0])
+
+        # Rows: (Intercept), geo  ·  Columns: Estimate, Std.Error, t value, Pr(>|t|)
+        if coef_matrix.shape[0] < 2:
+            raise ValueError("PGLS coefficient matrix has unexpected shape")
+
+        slope = float(coef_matrix[1, 0])
+        se = float(coef_matrix[1, 1])
+        t_stat = float(coef_matrix[1, 2])
+        p_val = float(coef_matrix[1, 3])
+
+        # Clean up R workspace
+        ro.r("rm(.syrinx_tree, .syrinx_df, .syrinx_cdat, .syrinx_pgls, .syrinx_summ, .syrinx_coef, .syrinx_lam)")
+        for key in ["_syrinx_species", "_syrinx_acoustic", "_syrinx_geo", "_syrinx_newick"]:
+            try:
+                del ro.globalenv[key]
+            except Exception:
+                pass
+
+        return {
+            "slope": slope,
+            "se": se,
+            "t": t_stat,
+            "p_value": p_val,
+            "pagel_lambda": lambda_val,
+            "alpha_secondary": 0.05,
+            "significant": p_val < 0.05,
+            "method": "caper::pgls",
+            "predictor": "mean_geographic_distance",
+            "response": "mean_acoustic_distance",
+        }
+
+    except Exception as exc:
+        logger.warning("PGLS via rpy2/caper failed: %s", exc)
+        return {"error": str(exc), "method": "caper::pgls"}
 
 
 def _mantel_python(

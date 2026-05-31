@@ -102,6 +102,8 @@ def align_all(
         D_all, song_strings, aligner, cfg, run_log
     )
 
+    _make_figure_3(null_result, cfg)
+
     if not null_result["passed"]:
         diag = {
             "error": "PipelineGatingError",
@@ -645,3 +647,77 @@ def _compute_noise_floors(
         "lenient_p95": float(np.percentile(lenient_dists, 95)) if lenient_dists else None,
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# Figure 3 — null model percentile rank histogram
+# ---------------------------------------------------------------------------
+
+def _make_figure_3(null_result: dict[str, Any], cfg: Config) -> None:
+    """Histogram of per-pair percentile ranks overlaid on the uniform null (Figure 3).
+
+    Parameters
+    ----------
+    null_result:
+        Output of :func:`_run_null_model`, containing ``percentile_ranks``.
+    cfg:
+        Pipeline configuration.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logger.warning("plotly not available; Figure 3 not generated")
+        return
+
+    ranks = null_result.get("percentile_ranks", [])
+    if not ranks:
+        logger.warning("No percentile ranks available; Figure 3 not generated")
+        return
+
+    ranks_arr = np.array(ranks)
+    n_bins = 20
+    bin_width = 1.0 / n_bins
+    uniform_density = 1.0  # density = 1 for Uniform[0,1]
+
+    binom_p = null_result.get("binomial_p", float("nan"))
+    prop_above = null_result.get("proportion_above", float("nan"))
+    n_pairs = null_result.get("n_pairs", len(ranks))
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=ranks_arr,
+        nbinsx=n_bins,
+        histnorm="probability density",
+        name="Observed percentile ranks",
+        marker_color="#3498db",
+        opacity=0.75,
+    ))
+    fig.add_hline(
+        y=uniform_density,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Uniform null",
+        annotation_position="top right",
+    )
+    fig.add_vline(
+        x=null_result.get("threshold_alpha", 0.025),
+        line_dash="dot",
+        line_color="orange",
+        annotation_text="97.5th-pct tail",
+        annotation_position="top left",
+    )
+    fig.update_layout(
+        title=(
+            f"Figure 3: Null model percentile rank distribution "
+            f"(n={n_pairs} pairs, binomial p={binom_p:.4f}, "
+            f"prop above tail={prop_above:.3f})"
+        ),
+        xaxis_title="Percentile rank of observed distance within null distribution",
+        yaxis_title="Density",
+        bargap=0.05,
+    )
+
+    fig_dir = cfg.data_path / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(fig_dir / "figure_3.html"))
+    logger.info("Figure 3 saved")
