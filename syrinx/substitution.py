@@ -63,15 +63,26 @@ def build_substitution_matrix(
 
     logger.info("Building substitution matrix for %d clusters", n_clusters)
 
-    # Match scores: within-cluster mean pairwise Euclidean distance, negated
-    match_scores = _compute_match_scores(labels_array, unique_labels, X, centroids)
-
-    # Mismatch penalties at each configured percentile
-    matrices: dict[int, np.ndarray] = {}
-    for pct in cfg.mismatch_percentiles:
-        mat = _build_matrix(centroids, match_scores, unique_labels, percentile=pct)
-        matrices[pct] = mat
-        logger.debug("Built substitution matrix at %dth percentile", pct)
+    if cfg.use_temporal_features and syllables:
+        # Temporal mode: use mean intra-cluster DTW distance for match scores and
+        # mean inter-cluster DTW centroid distance for mismatch penalties.
+        logger.info("Temporal mode: using DTW distances for substitution matrix")
+        match_scores, dtw_centroids = _compute_match_scores_dtw(
+            labels_array, unique_labels, syllables
+        )
+        matrices: dict[int, np.ndarray] = {}
+        for pct in cfg.mismatch_percentiles:
+            mat = _build_matrix_dtw(dtw_centroids, match_scores, unique_labels, percentile=pct)
+            matrices[pct] = mat
+            logger.debug("Built DTW substitution matrix at %dth percentile", pct)
+    else:
+        # Default: Euclidean centroid distances
+        match_scores = _compute_match_scores(labels_array, unique_labels, X, centroids)
+        matrices: dict[int, np.ndarray] = {}
+        for pct in cfg.mismatch_percentiles:
+            mat = _build_matrix(centroids, match_scores, unique_labels, percentile=pct)
+            matrices[pct] = mat
+            logger.debug("Built substitution matrix at %dth percentile", pct)
 
     primary_matrix = matrices[cfg.primary_mismatch_percentile]
 
@@ -180,6 +191,101 @@ def _build_matrix(
                 # Linear scale from 0 to max_penalty
                 mat[i, j] = -(normalised[i, j] * max_penalty)
 
+    return mat
+
+
+# ---------------------------------------------------------------------------
+# DTW-based matrix construction (temporal mode)
+# ---------------------------------------------------------------------------
+
+def _compute_match_scores_dtw(
+    labels_array: np.ndarray,
+    unique_labels: list[int],
+    syllables: list[dict],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-cluster match scores and DTW-distance centroids.
+
+    Match score for cluster k = −mean pairwise DTW distance between syllable
+    clips in that cluster (uses the ``mfcc_temporal`` matrices stored during
+    feature extraction).
+
+    Returns
+    -------
+    match_scores : np.ndarray, shape (n_clusters,)
+    dtw_centroids : np.ndarray, shape (n_clusters, n_clusters)
+        Mean DTW distance between every pair of clusters (upper-triangle used
+        for mismatch penalty scaling).
+    """
+    from dtaidistance import dtw_ndim
+
+    _MAX_PAIRS = 50  # cap expensive pairwise DTW within each cluster
+
+    n = len(unique_labels)
+    match_scores = np.zeros(n)
+    temporal_by_label: dict[int, list[np.ndarray]] = {}
+
+    for i, syl in enumerate(syllables):
+        lb = int(labels_array[i])
+        if lb == -1:
+            continue
+        mt = syl.get("mfcc_temporal")
+        if mt is not None:
+            temporal_by_label.setdefault(lb, []).append(np.array(mt, dtype=np.float64))
+
+    for i, lb in enumerate(unique_labels):
+        clips = temporal_by_label.get(lb, [])
+        if len(clips) < 2:
+            match_scores[i] = 0.0
+            continue
+        sampled = clips[:_MAX_PAIRS]
+        dists = []
+        for a in range(len(sampled)):
+            for b in range(a + 1, len(sampled)):
+                try:
+                    d = dtw_ndim.distance(sampled[a].T, sampled[b].T)
+                    dists.append(d)
+                except Exception:
+                    pass
+        match_scores[i] = -float(np.mean(dists)) if dists else 0.0
+
+    # Inter-cluster DTW using one representative clip per cluster
+    dtw_centroids = np.zeros((n, n))
+    reps = []
+    for lb in unique_labels:
+        clips = temporal_by_label.get(lb, [])
+        reps.append(clips[0] if clips else np.zeros((26, 1)))
+    for i in range(n):
+        for j in range(i + 1, n):
+            try:
+                d = dtw_ndim.distance(reps[i].T, reps[j].T)
+            except Exception:
+                d = 0.0
+            dtw_centroids[i, j] = d
+            dtw_centroids[j, i] = d
+
+    return match_scores, dtw_centroids
+
+
+def _build_matrix_dtw(
+    dtw_centroids: np.ndarray,
+    match_scores: np.ndarray,
+    unique_labels: list[int],
+    percentile: int,
+) -> np.ndarray:
+    """Build a substitution matrix using DTW inter-cluster distances."""
+    n = len(unique_labels)
+    off_diag = dtw_centroids[np.triu_indices(n, k=1)]
+    max_penalty = float(np.percentile(off_diag, percentile)) if off_diag.size > 0 else 1.0
+    max_dist = float(dtw_centroids.max()) if dtw_centroids.max() > 0 else 1.0
+    normalised = dtw_centroids / max_dist
+
+    mat = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                mat[i, j] = match_scores[i]
+            else:
+                mat[i, j] = -(normalised[i, j] * max_penalty)
     return mat
 
 
@@ -306,7 +412,7 @@ def _evaluate_gap_penalty(
     gap_extend:
         Gap extend penalty.
     """
-    from Bio.Align import PairwiseAligner
+    from Bio.Align import PairwiseAligner, substitution_matrices
 
     label_to_idx = {lb: i for i, lb in enumerate(unique_labels)}
     species = sorted(species_strings.keys())
@@ -317,6 +423,21 @@ def _evaluate_gap_penalty(
 
     aligner = PairwiseAligner()
     aligner.mode = "global"
+
+    alphabet_list = sorted(letter_to_int.keys())
+    n = len(alphabet_list)
+    array_2d = np.zeros((n, n))
+    for i, li in enumerate(alphabet_list):
+        for j, lj in enumerate(alphabet_list):
+            ii = label_to_idx[letter_to_int[li]]
+            ij = label_to_idx[letter_to_int[lj]]
+            array_2d[i, j] = float(sub_matrix[ii, ij])
+    if all(len(lt) == 1 for lt in alphabet_list):
+        alphabet_key: str | tuple = "".join(alphabet_list)
+    else:
+        alphabet_key = tuple(alphabet_list)
+    aligner.substitution_matrix = substitution_matrices.Array(alphabet_key, 2, data=array_2d)
+
     aligner.open_gap_score = gap_open
     aligner.extend_gap_score = gap_extend
 

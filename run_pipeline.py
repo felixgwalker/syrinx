@@ -65,18 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = Path("data/manifests") / f"pipeline_run_{timestamp}.log"
+
+    # Step 1: Load and validate config (must precede logging so we can use cfg.data_path)
+    try:
+        cfg = load_config(args.config)
+    except Exception as exc:
+        configure_logging(level=args.log_level)
+        logging.getLogger(__name__).error("Config load failed: %s", exc)
+        return 1
+
+    log_path = cfg.data_path / "manifests" / f"pipeline_run_{timestamp}.log"
     configure_logging(level=args.log_level, log_path=log_path)
 
     logger = logging.getLogger(__name__)
     logger.info("Syrinx pipeline starting — dataset=%s", args.dataset)
-
-    # Step 1: Load and validate config
-    try:
-        cfg = load_config(args.config)
-    except Exception as exc:
-        logger.error("Config load failed: %s", exc)
-        return 1
 
     if args.cap is not None:
         cfg.recording_cap = args.cap
@@ -173,6 +175,15 @@ def main(argv: list[str] | None = None) -> int:
             "n_syllables": len(syllables),
             "n_species": len(species_set),
         })
+
+        # Step 5b: Prepare zebra finch reference (§2.5 — must precede vocabulary)
+        logger.info("Step 5b: Preparing zebra finch reference data…")
+        from syrinx.acquire import prepare_zebrafinch_reference
+        try:
+            prepare_zebrafinch_reference(cfg)
+        except Exception as exc:
+            logger.error("Zebra finch reference preparation failed: %s", exc)
+            return 1
 
         # Step 6: Vocabulary
         logger.info("Step 6: Building and validating vocabulary…")

@@ -273,9 +273,9 @@ def _run_mantel_python(
     n_perm:
         Number of permutations.
     """
-    obs_r, _ = spearmanr(x, y)
+    obs_r = float(np.corrcoef(x, y)[0, 1])
     rng = np.random.RandomState()
-    null = [spearmanr(rng.permutation(x), y).statistic for _ in range(n_perm)]
+    null = [float(np.corrcoef(rng.permutation(x), y)[0, 1]) for _ in range(n_perm)]
     p = float(np.mean([abs(n) >= abs(obs_r) for n in null]))
     return p
 

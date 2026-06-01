@@ -20,6 +20,12 @@ def cfg(tmp_path_factory):
     cfg.output_dir = str(tmpdir / "out")
     cfg.mrm_permutations = 99
     cfg.bootstrap_n = 30
+    # Create minimal zebra finch reference files required by §2.5 check
+    ref_dir = tmpdir / "reference"
+    ref_dir.mkdir()
+    rng = np.random.RandomState(0)
+    np.save(ref_dir / "zebrafinch_features.npy", rng.randn(30, 36).astype(np.float64))
+    np.save(ref_dir / "zebrafinch_labels.npy", rng.randint(0, 5, size=30))
     return cfg
 
 

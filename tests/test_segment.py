@@ -115,6 +115,11 @@ class TestMAOValidation:
 
         assert "completed" in result
         assert "birdnet_primary" in result
+        if result.get("powdermill_mao_ms") is not None:
+            assert result["powdermill_mao_ms"] < cfg.segmentation_mao_threshold_ms, (
+                f"Powdermill MAO {result['powdermill_mao_ms']:.1f} ms ≥ threshold "
+                f"{cfg.segmentation_mao_threshold_ms} ms (preregistered gating criterion)"
+            )
 
     def test_mao_computation_synthetic(self, cfg, tmp_path):
         """MAO computation produces finite value on synthetic annotations."""

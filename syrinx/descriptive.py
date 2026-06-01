@@ -51,12 +51,30 @@ def compute_descriptives(
     sp_sequences = _build_sequences(syllables, labels_array, cluster_letters, key="species")
     rec_sequences = _build_sequences(syllables, labels_array, cluster_letters, key="xc_id")
 
-    # Entropy measures per species
+    # Entropy measures per species: compute per recording, then take mean
     species_entropy: dict[str, dict[str, float]] = {}
+    sp_of_rec = {xc_id: syl.get("species", "unknown")
+                 for syl in syllables for xc_id in [syl.get("xc_id", "")]}
     for sp, seqs in sp_sequences.items():
-        combined = "".join(seqs)
-        h1, h2, c = compute_entropy_measures(combined)
-        species_entropy[sp] = {"H1": h1, "H2": h2, "C": c}
+        per_rec_h1, per_rec_h2, per_rec_c = [], [], []
+        for xc_id, seq in zip(
+            [s.get("xc_id", "") for s in syllables if s.get("species") == sp],
+            seqs,
+        ):
+            if not seq:
+                continue
+            h1, h2, c = compute_entropy_measures(seq)
+            per_rec_h1.append(h1)
+            per_rec_h2.append(h2)
+            per_rec_c.append(c)
+        if per_rec_h1:
+            species_entropy[sp] = {
+                "H1": float(np.mean(per_rec_h1)),
+                "H2": float(np.mean(per_rec_h2)),
+                "C": float(np.mean(per_rec_c)),
+            }
+        else:
+            species_entropy[sp] = {"H1": 0.0, "H2": 0.0, "C": 0.0}
 
     # Acoustic summary statistics per species
     species_acoustic = _acoustic_summary_per_species(syllables, labels_array)
@@ -78,6 +96,11 @@ def compute_descriptives(
         "species_stats": species_stats,
         "region_diversity": region_diversity,
         "umap_figure_path": str(fig_path),
+        "bbs_region_boundary_note": (
+            "BBS region boundaries are approximate lat/lon rectangles, not official "
+            "BTO reporting polygons. Recordings near region borders may be "
+            "misclassified. This feeds the preregistered H2 analysis."
+        ),
     }
 
     if run_log is not None:
@@ -165,6 +188,7 @@ def _acoustic_summary_per_species(
     FEAT_OFFSET = 30  # Features 30–35 in the 36-dim vector
 
     species_feats: dict[str, list[np.ndarray]] = {}
+    species_fm_depths: dict[str, list[float]] = {}
     for i, syl in enumerate(syllables):
         if labels_array[i] == -1:
             continue
@@ -173,6 +197,9 @@ def _acoustic_summary_per_species(
         if feats is None:
             continue
         species_feats.setdefault(sp, []).append(np.array(feats[FEAT_OFFSET:FEAT_OFFSET + 6]))
+        fm_d = syl.get("fm_depth_mean")
+        if fm_d is not None:
+            species_fm_depths.setdefault(sp, []).append(float(fm_d))
 
     result: dict[str, dict[str, float]] = {}
     for sp, feat_list in species_feats.items():
@@ -181,8 +208,8 @@ def _acoustic_summary_per_species(
         for j, name in enumerate(FEATURE_NAMES):
             stats[f"mean_{name}"] = float(X[:, j].mean())
             stats[f"sd_{name}"] = float(X[:, j].std())
-        # FM depth: not in feature vector directly; approximate from frequency range
-        stats["mean_fm_depth"] = stats.get("mean_freq_range", 0.0)
+        fm_d_list = species_fm_depths.get(sp, [])
+        stats["mean_fm_depth"] = float(np.mean(fm_d_list)) if fm_d_list else stats.get("mean_freq_range", 0.0)
         result[sp] = stats
 
     return result
@@ -290,7 +317,7 @@ def _add_mean_pairwise_distance(
         if region not in diversity or len(feats) < 2:
             diversity.setdefault(region, {})["mean_pairwise_distance"] = None
             continue
-        X = np.array(feats[:100])  # cap for efficiency
+        X = np.array(feats[:cfg.max_syllables_pairwise_distance])
         from scipy.spatial.distance import pdist
         dists = pdist(X, metric="euclidean")
         diversity[region]["mean_pairwise_distance"] = float(dists.mean()) if len(dists) > 0 else None
@@ -330,6 +357,16 @@ def _add_composite_diversity(diversity: dict[str, dict[str, Any]]) -> None:
 def _assign_bbs_region(lat: float, lon: float, cfg: Config) -> str | None:
     """Assign a lat/lon coordinate to a BBS reporting region.
 
+    .. warning:: **APPROXIMATION** — these boundaries are simplified lat/lon
+        rectangles, NOT the official BTO BBS reporting region polygons.  No
+        machine-readable version of the BTO boundaries was available at the
+        time of preregistration.  This function feeds the preregistered H2
+        analysis (vocal diversity ~ BBS population trend).  Misclassification
+        of recordings near region borders could affect the H2 result; this
+        limitation is reported in the output JSON and should be noted in the
+        supplement.  Replace with official BTO shapefiles if they become
+        available.
+
     Parameters
     ----------
     lat, lon:
@@ -337,16 +374,17 @@ def _assign_bbs_region(lat: float, lon: float, cfg: Config) -> str | None:
     cfg:
         Pipeline configuration.
     """
-    # Scotland
-    if lat > cfg.bbs_scotland_lat_threshold:
-        return "Scotland"
+    # Northern Ireland must be checked before Scotland: NI extends to ≈55.4°N,
+    # which overlaps the Scotland threshold (55.0°N) along the north Antrim coast.
+    if 54.0 <= lat <= 55.4 and -8.2 <= lon <= -5.3:
+        return "Northern Ireland"
     # Wales (approximate bounding box)
     if 51.3 <= lat <= 53.5 and -5.4 <= lon <= -2.6:
         return "Wales"
-    # Northern Ireland
-    if 54.0 <= lat <= 55.4 and -8.2 <= lon <= -5.3:
-        return "Northern Ireland"
-    # England quadrants (simplified)
+    # Scotland
+    if lat > cfg.bbs_scotland_lat_threshold:
+        return "Scotland"
+    # England quadrants (simplified — see approximation warning above)
     if lat < cfg.bbs_scotland_lat_threshold and lon > -2.0 and lat > 52.5:
         return "England-Midlands"
     if lat < 52.5 and lon > -2.0:

@@ -29,6 +29,97 @@ except ImportError:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def prepare_zebrafinch_reference(cfg: Config) -> None:
+    """Download and feature-extract zebra finch reference recordings (§2.5).
+
+    Produces ``data/reference/zebrafinch_features.npy``.  If the file already
+    exists it is left untouched.  The companion label file
+    ``data/reference/zebrafinch_labels.npy`` must be provided separately:
+    it should contain published syllable-type labels from Tchernichovski et al.
+    (2000) aligned one-to-one with the rows of the features array.
+
+    Parameters
+    ----------
+    cfg:
+        Pipeline configuration.
+
+    Raises
+    ------
+    RuntimeError
+        If no recordings can be downloaded or no syllables are segmented.
+    """
+    ref_dir = cfg.data_path / "reference"
+    features_path = ref_dir / "zebrafinch_features.npy"
+
+    if features_path.exists():
+        logger.info("Zebra finch reference features already present: %s", features_path)
+        return
+
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = ref_dir / "raw"
+    wav_dir = ref_dir / "wav"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    wav_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Downloading zebra finch reference recordings from Xeno-canto…")
+    recordings = _search_xc(cfg, "gen:Taeniopygia sp:guttata type:song q:A")
+    recordings = [r for r in recordings if _meets_duration(r, cfg.min_duration_s)]
+    rng = random.Random(cfg.random_seed)
+    rng.shuffle(recordings)
+    recordings = recordings[: cfg.zebrafinch_xc_cap]
+
+    seen_fps: set[str] = set()
+    downloaded: list[dict[str, Any]] = []
+    for rec in recordings:
+        result = _download_recording(
+            rec, raw_dir, wav_dir, cfg, prior_fingerprints=seen_fps
+        )
+        if result:
+            result["species"] = "Taeniopygia guttata"
+            downloaded.append(result)
+            if result.get("fingerprint"):
+                seen_fps.add(result["fingerprint"])
+
+    if not downloaded:
+        raise RuntimeError(
+            "Could not download any zebra finch recordings from Xeno-canto. "
+            "Check network connectivity and the XC API."
+        )
+    logger.info("Downloaded %d zebra finch reference recordings", len(downloaded))
+
+    from .segment import segment_all
+
+    zf_syllables = segment_all(cfg, downloaded)
+    if not zf_syllables:
+        raise RuntimeError(
+            "No syllables were segmented from the zebra finch reference recordings."
+        )
+
+    from .features import extract_features
+
+    zf_syllables = extract_features(cfg, zf_syllables)
+    if not zf_syllables:
+        raise RuntimeError(
+            "Feature extraction failed for all zebra finch reference syllables."
+        )
+
+    X_zf = np.vstack([s["features"] for s in zf_syllables]).astype(np.float64)
+    np.save(features_path, X_zf)
+    logger.info(
+        "Saved zebra finch reference features: %s (%d syllables, 36 dims)",
+        features_path, len(X_zf),
+    )
+
+    labels_path = ref_dir / "zebrafinch_labels.npy"
+    if not labels_path.exists():
+        logger.warning(
+            "zebrafinch_features.npy saved (%d rows). "
+            "You must also provide %s containing published syllable-type labels "
+            "from Tchernichovski et al. (2000), one integer label per row.",
+            len(X_zf), labels_path,
+        )
+
+
 def acquire(cfg: Config, dataset: str = "genus") -> list[dict[str, Any]]:
     """Download Xeno-canto recordings for the specified dataset.
 
@@ -80,6 +171,15 @@ def acquire(cfg: Config, dataset: str = "genus") -> list[dict[str, Any]]:
 
     logger.info("Found %d candidate recordings from Xeno-canto", len(recordings))
 
+    # Pre-fetch all grade B recordings in a single query to avoid one API call
+    # per species inside the loop below (which would hit rate limits at scale).
+    grade_b_query = query.replace("q:A", "q:B")
+    logger.info("Pre-fetching grade B recordings…")
+    all_grade_b = _search_xc(cfg, grade_b_query)
+    grade_b_by_species: dict[str, list[dict[str, Any]]] = {}
+    for r in all_grade_b:
+        grade_b_by_species.setdefault(r.get("sp", ""), []).append(r)
+
     # Group by species, apply recording cap per species
     by_species: dict[str, list[dict[str, Any]]] = {}
     for rec in recordings:
@@ -120,10 +220,10 @@ def acquire(cfg: Config, dataset: str = "genus") -> list[dict[str, Any]]:
                     prior_fingerprints.add(result["fingerprint"])
                 count += 1
 
-        # Grade B sensitivity analysis
+        # Grade B sensitivity analysis (uses pre-fetched results — no extra API call)
         grade_b_recs = [
-            r for r in _search_xc(cfg, query.replace("q:A", "q:B"))
-            if r.get("sp") == species and r["id"] not in exclusion_set and r["id"] not in prior_ids
+            r for r in grade_b_by_species.get(species, [])
+            if r["id"] not in exclusion_set and r["id"] not in prior_ids
         ]
         for rec in grade_b_recs[:5]:
             result = _download_recording(
@@ -289,6 +389,12 @@ def _meets_duration(rec: dict[str, Any], min_s: float) -> bool:
 def _in_breeding_window(rec: dict[str, Any], cfg: Config) -> bool:
     """Check whether a recording falls within the expected breeding season.
 
+    Uses the union of the Palearctic (Apr–Jul) and Asian (May–Aug) breeding
+    windows so that no valid recording is excluded regardless of species origin.
+    Per-species window selection would be more precise but requires a maintained
+    Asian Phylloscopus species list; the union is the conservative fallback
+    documented in the preregistered analysis plan.
+
     Parameters
     ----------
     rec:
@@ -303,7 +409,10 @@ def _in_breeding_window(rec: dict[str, Any], cfg: Config) -> bool:
         return True  # allow through if date is unavailable
     if month == 0:
         return True
-    lo, hi = cfg.breeding_window_palearctic
+    lo_pal, hi_pal = cfg.breeding_window_palearctic
+    lo_asi, hi_asi = cfg.breeding_window_asian
+    lo = min(lo_pal, lo_asi)
+    hi = max(hi_pal, hi_asi)
     return lo <= month <= hi
 
 

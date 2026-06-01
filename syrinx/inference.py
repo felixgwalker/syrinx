@@ -72,7 +72,29 @@ def run_inference(
     result: dict[str, Any] = {}
 
     if dataset in ("genus", "both"):
-        result["h1"] = _run_h1(cfg, alignment_result, species_metadata, run_log, molecular_tree)
+        result["h1"] = _run_h1(
+            cfg, alignment_result, species_metadata, run_log, molecular_tree,
+            descriptive_result=descriptive_result,
+        )
+
+        # Nominate-subspecies-only analysis (Item 4)
+        D_nom = alignment_result.get("nominate_only_distance_matrix")
+        nominate_entities = alignment_result.get("nominate_entities", [])
+        if D_nom is not None and len(nominate_entities) >= 4:
+            nom_alignment = {
+                **alignment_result,
+                "distance_matrix": D_nom,
+                "species_names": nominate_entities,
+            }
+            result["h1_nominate"] = _run_h1_nominate(
+                cfg, D_nom, nominate_entities,
+                alignment_result["species_names"],
+                species_metadata, run_log,
+            )
+            result["nominate_vs_full_comparison"] = _compare_nominate_vs_full(
+                result["h1"], result["h1_nominate"]
+            )
+
     if dataset in ("within_species", "both"):
         result["h2"] = _run_h2(cfg, descriptive_result, run_log)
         result["h3"] = _run_h3(cfg, alignment_result, run_log)
@@ -136,6 +158,7 @@ def _run_h1(
     species_metadata: list[dict[str, Any]],
     run_log: Any,
     molecular_tree: Any = None,
+    descriptive_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run H1 MRM analysis and complementary PGLS.
 
@@ -151,6 +174,8 @@ def _run_h1(
         Optional PipelineRunLog.
     molecular_tree:
         Bio.Phylo molecular reference tree, or None.
+    descriptive_result:
+        Descriptive stats dict supplying the four PGLS response traits.
     """
     D_acoustic = alignment_result["distance_matrix"]
     species_names = alignment_result["species_names"]
@@ -175,22 +200,28 @@ def _run_h1(
     # Primary: MRM via R ecodist
     mrm_result = _run_mrm_r(acoustic_vec, molecular_vec, geo_vec, cfg)
 
+    # Bootstrap 95% CI on the MRM partial coefficient (recording resamples)
+    mrm_bootstrap_ci = _compute_mrm_bootstrap_ci(
+        alignment_result.get("bootstrap_cis", {}),
+        molecular_vec, geo_vec, cfg,
+    )
+
+    # Permutation-based 95% CI on the MRM partial coefficient (preregistered)
+    mrm_permutation_ci = _compute_mrm_permutation_ci(acoustic_vec, molecular_vec, geo_vec, cfg)
+
     # Secondary Mantel tests
     mantel_pearson = _run_mantel_r(acoustic_vec, molecular_vec, cfg, method="pearson")
     mantel_spearman = _run_mantel_r(acoustic_vec, molecular_vec, cfg, method="spearman")
     mantel_geo = _run_mantel_r(acoustic_vec, geo_vec, cfg, method="pearson")
 
     # Partial Mantel if both acoustic~molecular and acoustic~geo are significant
-    if mantel_pearson.get("p_value", 1.0) < 0.05 and mantel_geo.get("p_value", 1.0) < 0.05:
+    # (α = cfg.bonferroni_alpha per preregistered analysis plan §2.8.3)
+    if mantel_pearson.get("p_value", 1.0) < cfg.bonferroni_alpha and mantel_geo.get("p_value", 1.0) < cfg.bonferroni_alpha:
         partial_mantel = _run_partial_mantel_r(acoustic_vec, molecular_vec, geo_vec, cfg)
     else:
         partial_mantel = None
 
-    # Bootstrap CI from recording resampling
-    bootstrap_cis = alignment_result.get("bootstrap_cis", {})
-
     # Biological meaningfulness
-    coef = mrm_result.get("molecular_coefficient", float("nan"))
     spr2 = mrm_result.get("semipartial_r2", float("nan"))
     statistically_sig = mrm_result.get("p_value", 1.0) < cfg.bonferroni_alpha
     biologically_meaningful = (
@@ -198,15 +229,30 @@ def _run_h1(
     )
 
     interpretation = _interpret_result(
-        statistically_sig, biologically_meaningful, cfg.h1_biological_threshold_semipartial_r2, spr2, "semi-partial r²"
+        statistically_sig, biologically_meaningful,
+        cfg.h1_biological_threshold_semipartial_r2, spr2, "semi-partial r²",
     )
 
-    # Complementary PGLS (secondary, α = 0.05 uncorrected)
-    pgls_result = _run_pgls_r(species_names, D_acoustic, D_geo, molecular_tree, cfg)
+    # Complementary PGLS — four preregistered acoustic traits ~ geo (Item 1).
+    # Per-species geographic means (off-diagonal row means of D_geo).
+    D_ge = D_geo.copy().astype(float)
+    np.fill_diagonal(D_ge, np.nan)
+    geo_means = np.nanmean(D_ge, axis=1)
+
+    pgls_result: dict[str, Any]
+    if descriptive_result is not None:
+        trait_values = _extract_species_acoustic_traits(species_names, descriptive_result)
+        pgls_result = _run_pgls_four_traits_r(
+            species_names, trait_values, geo_means, molecular_tree, cfg
+        )
+    else:
+        pgls_result = {"error": "descriptive_result not provided; PGLS skipped"}
 
     result = {
         "mrm": mrm_result,
-        "pgls": pgls_result,
+        "mrm_bootstrap_ci": mrm_bootstrap_ci,
+        "mrm_permutation_ci": mrm_permutation_ci,
+        "pgls_four_traits": pgls_result,
         "mantel_pearson": mantel_pearson,
         "mantel_spearman": mantel_spearman,
         "mantel_geographic": mantel_geo,
@@ -237,6 +283,108 @@ def _run_h1(
 
     _make_figure_6(D_acoustic, D_molecular, species_names, mrm_result, cfg)
     return result
+
+
+def _run_h1_nominate(
+    cfg: Config,
+    D_nom: np.ndarray,
+    nominate_entities: list[str],
+    full_species_names: list[str],
+    species_metadata: list[dict[str, Any]],
+    run_log: Any,
+) -> dict[str, Any]:
+    """Lightweight H1 MRM for nominate-subspecies-only recordings.
+
+    Loads molecular distances, subsets to nominate species, and runs MRM.
+    Only the primary MRM comparison is run (no secondary Mantel/PGLS).
+
+    Parameters
+    ----------
+    cfg:
+        Pipeline configuration.
+    D_nom:
+        Acoustic distance matrix for nominate entities.
+    nominate_entities:
+        Species labels for the nominate-only analysis.
+    full_species_names:
+        Full species list from the primary analysis (used to index into
+        the full molecular distance matrix).
+    species_metadata:
+        Per-species metadata with lat/lon.
+    run_log:
+        Optional PipelineRunLog.
+    """
+    D_molecular_full = _load_molecular_distances(cfg, full_species_names)
+    if D_molecular_full is None:
+        return {"error": "molecular distances unavailable"}
+
+    # Index into full molecular matrix
+    full_idx = {sp: i for i, sp in enumerate(full_species_names)}
+    nom_indices = [full_idx[sp] for sp in nominate_entities if sp in full_idx]
+    if len(nom_indices) < 4:
+        return {"error": "insufficient nominate species with molecular data"}
+
+    D_mol_nom = D_molecular_full[np.ix_(nom_indices, nom_indices)]
+
+    meta_by_sp = {m["species"]: m for m in species_metadata}
+    lats = [meta_by_sp.get(sp, {}).get("lat", 0.0) or 0.0 for sp in nominate_entities]
+    lons = [meta_by_sp.get(sp, {}).get("lon", 0.0) or 0.0 for sp in nominate_entities]
+    D_geo_nom = geographic_distance_matrix(lats, lons)
+
+    acoustic_vec = upper_triangle(D_nom)
+    molecular_vec = upper_triangle(D_mol_nom)
+    geo_vec = upper_triangle(D_geo_nom)
+
+    mrm_result = _run_mrm_r(acoustic_vec, molecular_vec, geo_vec, cfg)
+
+    spr2 = mrm_result.get("semipartial_r2", float("nan"))
+    statistically_sig = mrm_result.get("p_value", 1.0) < cfg.bonferroni_alpha
+    biologically_meaningful = (
+        not np.isnan(spr2) and spr2 >= cfg.h1_biological_threshold_semipartial_r2
+    )
+
+    return {
+        "mrm": mrm_result,
+        "n_species": len(nominate_entities),
+        "statistically_significant": statistically_sig,
+        "biologically_meaningful": biologically_meaningful,
+        "note": "Nominate-subspecies-only analysis: non-nominate recordings excluded.",
+    }
+
+
+def _compare_nominate_vs_full(
+    full_result: dict[str, Any],
+    nominate_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Flag where nominate-only and full-dataset H1 conclusions diverge.
+
+    Parameters
+    ----------
+    full_result:
+        H1 result from the full (all-subspecies) analysis.
+    nominate_result:
+        H1 result from the nominate-only analysis.
+    """
+    full_sig = full_result.get("statistically_significant", False)
+    nom_sig = nominate_result.get("statistically_significant", False)
+    full_bio = full_result.get("biologically_meaningful", False)
+    nom_bio = nominate_result.get("biologically_meaningful", False)
+
+    divergent = (full_sig != nom_sig) or (full_bio != nom_bio)
+
+    return {
+        "divergent": divergent,
+        "full_statistically_significant": full_sig,
+        "nominate_statistically_significant": nom_sig,
+        "full_biologically_meaningful": full_bio,
+        "nominate_biologically_meaningful": nom_bio,
+        "note": (
+            "Nominate-only and full-dataset analyses reach different conclusions. "
+            "This may indicate that non-nominate subspecies drive the main result."
+            if divergent else
+            "Nominate-only and full-dataset analyses agree."
+        ),
+    }
 
 
 def _run_mrm_r(
@@ -336,6 +484,321 @@ def _estimate_semipartial_r2(
     return max(0.0, r2(X_full) - r2(X_geo_only))
 
 
+def _extract_species_acoustic_traits(
+    species_names: list[str],
+    descriptive_result: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    """Extract the four preregistered PGLS response variables from descriptive stats.
+
+    Returns a dict mapping trait label → per-species ndarray (NaN for missing species).
+
+    Traits
+    ------
+    mean_C:
+        Per-species syntactic complexity C = H1 − H2, averaged across syllables.
+    mean_peak_freq:
+        Per-species mean peak frequency (Hz).
+    mean_freq_range:
+        Per-species mean frequency range = peak − min frequency (Hz).
+    mean_fm_depth:
+        Per-species mean FM depth (approximated as frequency range;
+        true instantaneous FM depth is not separately tracked in the feature set).
+    """
+    species_stats = descriptive_result.get("species_stats", {})
+    trait_keys = {
+        "mean_C": "C",
+        "mean_peak_freq": "mean_peak_freq",
+        "mean_freq_range": "mean_freq_range",
+        "mean_fm_depth": "mean_fm_depth",
+    }
+    result: dict[str, np.ndarray] = {}
+    for label, stat_key in trait_keys.items():
+        result[label] = np.array([
+            float(species_stats.get(sp, {}).get(stat_key, float("nan")))
+            for sp in species_names
+        ])
+    return result
+
+
+def _compute_mrm_bootstrap_ci(
+    bootstrap_cis: dict[str, Any],
+    molecular_vec: np.ndarray,
+    geo_vec: np.ndarray,
+    cfg: Config,
+) -> dict[str, Any] | None:
+    """Compute 95% CI on the MRM partial coefficient via recording bootstrap.
+
+    For each replicate acoustic distance vector stored in *bootstrap_cis*,
+    the MRM molecular partial coefficient is estimated and the 2.5th/97.5th
+    percentiles are taken as the CI.  Uses R/ecodist when available; falls
+    back to sklearn OLS (coefficient only, not permutation p-value) otherwise
+    — the OLS partial coefficient equals the MRM coefficient.
+
+    Parameters
+    ----------
+    bootstrap_cis:
+        Dict returned by :func:`~syrinx.align._recording_bootstrap`; must
+        contain ``"bootstrap_acoustic_vecs"``.
+    molecular_vec, geo_vec:
+        Upper-triangle molecular and geographic distance vectors for the
+        same species set.
+    cfg:
+        Pipeline configuration.
+    """
+    boot_vecs = bootstrap_cis.get("bootstrap_acoustic_vecs", [])
+    if not boot_vecs:
+        return None
+
+    r_available = False
+    try:
+        import rpy2.robjects  # noqa: F401
+        r_available = True
+    except Exception:
+        pass
+
+    coefs: list[float] = []
+    for v in boot_vecs:
+        av = np.array(v)
+        if av.shape[0] < 3:
+            continue
+        if r_available:
+            r = _run_mrm_r(av, molecular_vec, geo_vec, cfg)
+            coef = r.get("molecular_coefficient")
+            if coef is not None and not np.isnan(float(coef)):
+                coefs.append(float(coef))
+        else:
+            # OLS fallback: the MRM molecular coefficient equals the OLS
+            # partial coefficient from the multiple regression.
+            try:
+                from sklearn.linear_model import LinearRegression
+                X = np.column_stack([molecular_vec, geo_vec])
+                if X.shape[0] >= X.shape[1] + 1:
+                    lr = LinearRegression().fit(X, av)
+                    coefs.append(float(lr.coef_[0]))
+            except Exception:
+                pass
+
+    if len(coefs) < 2:
+        return None
+
+    return {
+        "ci_lower": float(np.percentile(coefs, 2.5)),
+        "ci_upper": float(np.percentile(coefs, 97.5)),
+        "n_replicates": len(coefs),
+        "method": "recording_bootstrap_mrm_coefficient",
+        "coefficient_estimator": "rpy2_ecodist_mrm" if r_available else "sklearn_ols_fallback",
+    }
+
+
+def _compute_mrm_permutation_ci(
+    acoustic_vec: np.ndarray,
+    molecular_vec: np.ndarray,
+    geo_vec: np.ndarray,
+    cfg: Config,
+) -> dict[str, Any] | None:
+    """Compute permutation-based 95% CI on the MRM molecular partial coefficient.
+
+    Runs MRM on each permutation of the acoustic distance vector to build a null
+    distribution for the molecular coefficient.  The 2.5th and 97.5th percentiles
+    of that distribution form the permutation CI (preregistered output, §2.8.2).
+
+    Uses the sklearn OLS estimator (MRM coefficient = OLS partial coefficient) to
+    avoid 9999 rpy2/R invocations; the R path is used only for the primary result.
+
+    Parameters
+    ----------
+    acoustic_vec, molecular_vec, geo_vec:
+        Upper-triangle distance vectors.
+    cfg:
+        Pipeline configuration (uses ``cfg.mrm_permutations``).
+    """
+    if acoustic_vec.shape[0] < 4:
+        return None
+
+    rng = np.random.RandomState(cfg.random_seed + 7)
+    coefs: list[float] = []
+    try:
+        from sklearn.linear_model import LinearRegression
+
+        X_predictors = np.column_stack([molecular_vec, geo_vec])
+        if X_predictors.shape[0] < X_predictors.shape[1] + 1:
+            return None
+        for _ in range(cfg.mrm_permutations):
+            perm_acoustic = rng.permutation(acoustic_vec)
+            lr = LinearRegression().fit(X_predictors, perm_acoustic)
+            coefs.append(float(lr.coef_[0]))
+    except Exception as exc:
+        logger.warning("Permutation CI computation failed: %s", exc)
+        return None
+
+    if len(coefs) < 2:
+        return None
+
+    return {
+        "ci_lower": float(np.percentile(coefs, 2.5)),
+        "ci_upper": float(np.percentile(coefs, 97.5)),
+        "n_permutations": len(coefs),
+        "method": "permutation_null_distribution_mrm_coefficient",
+    }
+
+
+def _run_pgls_four_traits_r(
+    species_names: list[str],
+    trait_values: dict[str, np.ndarray],
+    geo_means: np.ndarray,
+    molecular_tree: Any,
+    cfg: Config,
+) -> dict[str, Any]:
+    """Run PGLS under the Alström topology for each of the four preregistered traits.
+
+    Each trait is regressed on per-species mean geographic distance (off-diagonal
+    row mean of D_geo), i.e. ``trait ~ geo_mean``.  The geographic predictor was
+    chosen as the closest measurable proxy for the RR's "species-level predictors"
+    (§2.10.3), which are not named explicitly in the registered report; this choice
+    must be confirmed or revised against the final RR wording before submission.
+    α = 0.05 uncorrected (preregistered secondary analysis, §2.10.3).
+
+    Parameters
+    ----------
+    species_names:
+        Species labels in alignment order.
+    trait_values:
+        Dict mapping trait label → per-species ndarray (NaN for missing).
+    geo_means:
+        Per-species mean geographic distance (off-diagonal row mean of D_geo).
+    molecular_tree:
+        Bio.Phylo reference tree for PGLS correlation structure.
+    cfg:
+        Pipeline configuration.
+    """
+    if molecular_tree is None:
+        return {"error": "no molecular tree provided for PGLS"}
+    if len(species_names) < 4:
+        return {"error": f"too few species for PGLS (n={len(species_names)})"}
+
+    results: dict[str, Any] = {}
+    for trait_label, trait_vec in trait_values.items():
+        valid_mask = ~np.isnan(trait_vec)
+        n_valid = int(valid_mask.sum())
+        if n_valid < 4:
+            results[trait_label] = {
+                "error": f"insufficient valid values (n={n_valid})",
+                "response": trait_label,
+            }
+            continue
+        valid_species = [sp for sp, v in zip(species_names, valid_mask) if v]
+        valid_trait = trait_vec[valid_mask]
+        valid_geo = geo_means[valid_mask]
+        results[trait_label] = _run_pgls_single_trait_r(
+            valid_species, valid_trait, valid_geo, molecular_tree, trait_label, cfg
+        )
+    return results
+
+
+def _run_pgls_single_trait_r(
+    species_names: list[str],
+    trait_values: np.ndarray,
+    geo_means: np.ndarray,
+    molecular_tree: Any,
+    trait_label: str,
+    cfg: Config,
+) -> dict[str, Any]:
+    """Run one caper::pgls model: trait ~ geo under Alström topology.
+
+    Parameters
+    ----------
+    species_names:
+        Species labels (already filtered to valid observations).
+    trait_values:
+        Per-species trait means (no NaN).
+    geo_means:
+        Per-species mean geographic distances (no NaN).
+    molecular_tree:
+        Bio.Phylo reference tree.
+    trait_label:
+        Human-readable name used in logs and output JSON.
+    cfg:
+        Pipeline configuration.
+    """
+    try:
+        import io
+        import rpy2.robjects as ro
+        from rpy2.robjects import numpy2ri
+        from rpy2.robjects.packages import importr
+        from Bio import Phylo
+
+        numpy2ri.activate()
+        importr("ape")
+        importr("caper")
+
+        buf = io.StringIO()
+        Phylo.write(molecular_tree, buf, "newick")
+        newick_str = buf.getvalue().strip()
+
+        ro.globalenv["_syrinx_species"] = ro.StrVector(species_names)
+        ro.globalenv["_syrinx_trait"] = ro.FloatVector(trait_values.tolist())
+        ro.globalenv["_syrinx_geo"] = ro.FloatVector(geo_means.tolist())
+        ro.globalenv["_syrinx_newick"] = ro.StrVector([newick_str])
+
+        ro.r("""
+            .syrinx_tree <- ape::read.tree(text = `_syrinx_newick`)
+            .syrinx_df <- data.frame(
+                species = `_syrinx_species`,
+                trait   = `_syrinx_trait`,
+                geo     = `_syrinx_geo`,
+                stringsAsFactors = FALSE
+            )
+            .syrinx_cdat <- caper::comparative.data(
+                phy       = .syrinx_tree,
+                data      = .syrinx_df,
+                names.col = "species",
+                warn.dropped = FALSE
+            )
+            .syrinx_pgls <- caper::pgls(trait ~ geo, data = .syrinx_cdat, lambda = "ML")
+            .syrinx_summ <- summary(.syrinx_pgls)
+            .syrinx_coef <- coef(.syrinx_summ)
+            .syrinx_lam  <- .syrinx_pgls$param[["lambda"]]
+        """)
+
+        coef_matrix = np.array(ro.r[".syrinx_coef"])
+        lambda_val = float(ro.r[".syrinx_lam"][0])
+
+        if coef_matrix.shape[0] < 2:
+            raise ValueError("PGLS coef matrix has unexpected shape")
+
+        slope = float(coef_matrix[1, 0])
+        se = float(coef_matrix[1, 1])
+        t_stat = float(coef_matrix[1, 2])
+        p_val = float(coef_matrix[1, 3])
+
+        ro.r(
+            "rm(.syrinx_tree, .syrinx_df, .syrinx_cdat, "
+            ".syrinx_pgls, .syrinx_summ, .syrinx_coef, .syrinx_lam)"
+        )
+        for key in ["_syrinx_species", "_syrinx_trait", "_syrinx_geo", "_syrinx_newick"]:
+            try:
+                del ro.globalenv[key]
+            except Exception:
+                pass
+
+        return {
+            "slope": slope,
+            "se": se,
+            "t": t_stat,
+            "p_value": p_val,
+            "pagel_lambda": lambda_val,
+            "alpha_secondary": 0.05,
+            "significant": p_val < 0.05,
+            "method": "caper::pgls",
+            "predictor": "mean_geographic_distance",
+            "response": trait_label,
+        }
+
+    except Exception as exc:
+        logger.warning("PGLS for %s via rpy2/caper failed: %s", trait_label, exc)
+        return {"error": str(exc), "method": "caper::pgls", "response": trait_label}
+
+
 def _run_mantel_r(
     x: np.ndarray, y: np.ndarray, cfg: Config, method: str = "pearson"
 ) -> dict[str, Any]:
@@ -403,127 +866,6 @@ def _run_partial_mantel_r(
     except Exception as exc:
         logger.warning("Partial Mantel via rpy2 failed: %s", exc)
         return {"error": str(exc)}
-
-
-def _run_pgls_r(
-    species_names: list[str],
-    D_acoustic: np.ndarray,
-    D_geo: np.ndarray,
-    molecular_tree: Any,
-    cfg: Config,
-) -> dict[str, Any]:
-    """Secondary PGLS via caper: mean acoustic distance ~ mean geographic distance.
-
-    Uses Pagel's λ estimated by ML. Reports slope, SE, t, p, and λ.
-    α = 0.05 uncorrected (preregistered secondary analysis).
-
-    Parameters
-    ----------
-    species_names:
-        Ordered species labels matching rows/columns of the distance matrices.
-    D_acoustic:
-        n×n acoustic distance matrix.
-    D_geo:
-        n×n great-circle geographic distance matrix.
-    molecular_tree:
-        Bio.Phylo molecular reference tree, or None.
-    cfg:
-        Pipeline configuration.
-    """
-    if molecular_tree is None:
-        return {"error": "no molecular tree provided for PGLS"}
-
-    n = len(species_names)
-    if n < 4:
-        return {"error": f"too few species for PGLS (n={n})"}
-
-    # Per-species means across all other species (off-diagonal)
-    D_ac = D_acoustic.copy().astype(float)
-    D_ge = D_geo.copy().astype(float)
-    np.fill_diagonal(D_ac, np.nan)
-    np.fill_diagonal(D_ge, np.nan)
-    acoustic_means = np.nanmean(D_ac, axis=1)
-    geo_means = np.nanmean(D_ge, axis=1)
-
-    try:
-        import io
-        import rpy2.robjects as ro
-        from rpy2.robjects import numpy2ri
-        from rpy2.robjects.packages import importr
-        from Bio import Phylo
-
-        numpy2ri.activate()
-        ape = importr("ape")
-        caper = importr("caper")
-        base = importr("base")
-
-        # Serialise Bio.Phylo tree → Newick string
-        buf = io.StringIO()
-        Phylo.write(molecular_tree, buf, "newick")
-        newick_str = buf.getvalue().strip()
-
-        # Push data into R global environment with a unique prefix
-        ro.globalenv["_syrinx_species"] = ro.StrVector(species_names)
-        ro.globalenv["_syrinx_acoustic"] = ro.FloatVector(acoustic_means.tolist())
-        ro.globalenv["_syrinx_geo"] = ro.FloatVector(geo_means.tolist())
-        ro.globalenv["_syrinx_newick"] = ro.StrVector([newick_str])
-
-        ro.r("""
-            .syrinx_tree <- ape::read.tree(text = `_syrinx_newick`)
-            .syrinx_df <- data.frame(
-                species  = `_syrinx_species`,
-                acoustic = `_syrinx_acoustic`,
-                geo      = `_syrinx_geo`,
-                stringsAsFactors = FALSE
-            )
-            .syrinx_cdat <- caper::comparative.data(
-                phy       = .syrinx_tree,
-                data      = .syrinx_df,
-                names.col = "species",
-                warn.dropped = FALSE
-            )
-            .syrinx_pgls  <- caper::pgls(acoustic ~ geo, data = .syrinx_cdat, lambda = "ML")
-            .syrinx_summ  <- summary(.syrinx_pgls)
-            .syrinx_coef  <- coef(.syrinx_summ)
-            .syrinx_lam   <- .syrinx_pgls$param[["lambda"]]
-        """)
-
-        coef_matrix = np.array(ro.r[".syrinx_coef"])
-        lambda_val = float(ro.r[".syrinx_lam"][0])
-
-        # Rows: (Intercept), geo  ·  Columns: Estimate, Std.Error, t value, Pr(>|t|)
-        if coef_matrix.shape[0] < 2:
-            raise ValueError("PGLS coefficient matrix has unexpected shape")
-
-        slope = float(coef_matrix[1, 0])
-        se = float(coef_matrix[1, 1])
-        t_stat = float(coef_matrix[1, 2])
-        p_val = float(coef_matrix[1, 3])
-
-        # Clean up R workspace
-        ro.r("rm(.syrinx_tree, .syrinx_df, .syrinx_cdat, .syrinx_pgls, .syrinx_summ, .syrinx_coef, .syrinx_lam)")
-        for key in ["_syrinx_species", "_syrinx_acoustic", "_syrinx_geo", "_syrinx_newick"]:
-            try:
-                del ro.globalenv[key]
-            except Exception:
-                pass
-
-        return {
-            "slope": slope,
-            "se": se,
-            "t": t_stat,
-            "p_value": p_val,
-            "pagel_lambda": lambda_val,
-            "alpha_secondary": 0.05,
-            "significant": p_val < 0.05,
-            "method": "caper::pgls",
-            "predictor": "mean_geographic_distance",
-            "response": "mean_acoustic_distance",
-        }
-
-    except Exception as exc:
-        logger.warning("PGLS via rpy2/caper failed: %s", exc)
-        return {"error": str(exc), "method": "caper::pgls"}
 
 
 def _mantel_python(
@@ -712,6 +1054,63 @@ def _run_h3(
                 upper_triangle(sub_D_ac), upper_triangle(sub_D_geo), cfg
             )
 
+    # Cell-size sensitivity Mantel tests (Item 5)
+    cell_size_sensitivity: dict[str, Any] = {}
+    for cell_size_str, sens in alignment_result.get("h3_cell_size_sensitivity", {}).items():
+        cell_size_f = float(cell_size_str)
+        if sens.get("insufficient_cells"):
+            cell_size_sensitivity[cell_size_str] = {
+                "status": "insufficient_cells",
+                "cell_size_degrees": cell_size_f,
+            }
+            continue
+        ents = sens.get("entities", [])
+        D_s = sens.get("distance_matrix")
+        if D_s is None or len(ents) < cfg.min_cells_for_inference:
+            cell_size_sensitivity[cell_size_str] = {
+                "status": "insufficient_cells",
+                "n_cells": len(ents),
+                "cell_size_degrees": cell_size_f,
+            }
+            continue
+        lats_s, lons_s = _parse_cell_ids_with_size(ents, cell_size_f)
+        D_geo_s = geographic_distance_matrix(lats_s, lons_s)
+        mr_s = _run_mantel_r(upper_triangle(D_s), upper_triangle(D_geo_s), cfg, method="pearson")
+        cell_size_sensitivity[cell_size_str] = {
+            "mantel_pearson": mr_s,
+            "n_cells": len(ents),
+            "cell_size_degrees": cell_size_f,
+            "statistically_significant": mr_s.get("p_value", 1.0) < cfg.bonferroni_alpha,
+        }
+
+    # String-length sensitivity Mantel tests (Item 6)
+    length_sensitivity: dict[str, Any] = {}
+    for frac_str, length_data in alignment_result.get("h3_length_sensitivity", {}).items():
+        if length_data.get("insufficient_cells"):
+            length_sensitivity[frac_str] = {
+                "status": "insufficient_cells",
+                "truncate_fraction": float(frac_str),
+            }
+            continue
+        ents_f = length_data.get("entities", [])
+        D_f = length_data.get("distance_matrix")
+        if D_f is None or len(ents_f) < cfg.min_cells_for_inference:
+            length_sensitivity[frac_str] = {
+                "status": "insufficient_cells",
+                "n_cells": len(ents_f),
+                "truncate_fraction": float(frac_str),
+            }
+            continue
+        lats_f, lons_f = _parse_cell_ids(ents_f, cfg)
+        D_geo_f = geographic_distance_matrix(lats_f, lons_f)
+        mr_f = _run_mantel_r(upper_triangle(D_f), upper_triangle(D_geo_f), cfg, method="pearson")
+        length_sensitivity[frac_str] = {
+            "mantel_pearson": mr_f,
+            "n_cells": len(ents_f),
+            "truncate_fraction": float(frac_str),
+            "statistically_significant": mr_f.get("p_value", 1.0) < cfg.bonferroni_alpha,
+        }
+
     result = {
         "mantel_pearson": mantel_result,
         "mantel_spearman": mantel_spearman,
@@ -723,6 +1122,8 @@ def _run_h3(
         "interpretation": interpretation,
         "regional_split": split_results,
         "cell_size_degrees": cfg.cell_size_degrees,
+        "cell_size_sensitivity": cell_size_sensitivity,
+        "length_sensitivity": length_sensitivity,
     }
 
     if run_log is not None:
@@ -730,6 +1131,52 @@ def _run_h3(
         run_log.record_threshold("H3_mantel_r", r, cfg.h3_biological_threshold_mantel_r, biologically_meaningful, "stage9_H3")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# AVONET helper
+# ---------------------------------------------------------------------------
+
+def _load_avonet_habitat(cfg: Config, species_names: list[str]) -> dict[str, str]:
+    """Load AVONET habitat codes for the given species if the file exists.
+
+    Looks for ``cfg.avonet_data_path`` (CSV with columns ``Species1``/``species``
+    and ``Habitat``/``habitat``).  Returns an empty dict if the file is absent or
+    unreadable — the figure is generated without annotation in that case.
+
+    Parameters
+    ----------
+    cfg:
+        Pipeline configuration.
+    species_names:
+        Species labels to look up.
+    """
+    import csv
+
+    candidates = [
+        Path(cfg.avonet_data_path),
+        cfg.data_path / "avonet_traits.csv",
+    ]
+    avonet_path = next((p for p in candidates if p.exists()), None)
+    if avonet_path is None:
+        logger.debug("AVONET file not found; habitat annotation will be skipped")
+        return {}
+
+    try:
+        habitat_map: dict[str, str] = {}
+        with avonet_path.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                name = row.get("Species1") or row.get("species") or ""
+                habitat = row.get("Habitat") or row.get("habitat") or ""
+                if name and habitat:
+                    habitat_map[name.strip()] = habitat.strip()
+        result = {sp: habitat_map[sp] for sp in species_names if sp in habitat_map}
+        logger.info("AVONET habitat loaded for %d/%d species", len(result), len(species_names))
+        return result
+    except Exception as exc:
+        logger.warning("AVONET load failed: %s", exc)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -791,7 +1238,7 @@ def _make_figure_6(
         row=1, col=1,
     )
 
-    # Four-corner residuals
+    # Four-corner residuals with AVONET habitat-concordance annotation (§2.10.5)
     resid = acoustic_vec - fitted
     mol_med = np.median(molecular_vec)
     ac_med = np.median(acoustic_vec)
@@ -804,16 +1251,45 @@ def _make_figure_6(
         else:
             colours.append("#e74c3c")
 
+    # AVONET habitat-concordance lookup
+    avonet_habitat = _load_avonet_habitat(cfg, species_names)
+    avonet_available = bool(avonet_habitat)
+
+    # Build pair-level habitat-concordance flag for hover text
+    habitat_texts = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            h_i = avonet_habitat.get(species_names[i], "")
+            h_j = avonet_habitat.get(species_names[j], "")
+            if h_i and h_j:
+                concordant = h_i == h_j
+                habitat_texts.append(
+                    f"{species_names[i]}({h_i}) — {species_names[j]}({h_j}) "
+                    f"[{'same' if concordant else 'different'} habitat]"
+                )
+            else:
+                habitat_texts.append(pair_labels[len(habitat_texts)])
+
     fig.add_trace(
-        go.Scatter(x=molecular_vec, y=acoustic_vec, mode="markers",
-                   marker={"color": colours, "size": 5, "opacity": 0.7},
-                   text=pair_labels, name="four-corner"),
+        go.Scatter(
+            x=molecular_vec, y=acoustic_vec, mode="markers",
+            marker={"color": colours, "size": 5, "opacity": 0.7},
+            text=habitat_texts if avonet_available else pair_labels,
+            name="four-corner",
+        ),
         row=1, col=2,
     )
 
-    fig.update_layout(title="H1 MRM Analysis")
+    avonet_note = (
+        "AVONET habitat concordance annotated in hover text."
+        if avonet_available else
+        f"AVONET data not found at {cfg.avonet_data_path}; habitat annotation skipped."
+    )
+    fig.update_layout(
+        title=f"H1 MRM Analysis — {avonet_note}",
+    )
     fig.write_html(str(fig_dir / "figure_6.html"))
-    logger.info("Figure 6 saved")
+    logger.info("Figure 6 saved (AVONET annotation: %s)", "yes" if avonet_available else "no")
 
 
 def _make_figure_7(
@@ -939,9 +1415,24 @@ def _parse_cell_ids(
     cfg:
         Pipeline configuration.
     """
+    return _parse_cell_ids_with_size(cell_names, cfg.cell_size_degrees)
+
+
+def _parse_cell_ids_with_size(
+    cell_names: list[str], cell_size: float
+) -> tuple[list[float], list[float]]:
+    """Parse lat/lon from cell IDs, adding half the given cell size to reach centres.
+
+    Parameters
+    ----------
+    cell_names:
+        Cell identifier strings (``"lat_lon"`` format, floor-of-cell corner).
+    cell_size:
+        Cell edge length in degrees.
+    """
     lats = []
     lons = []
-    half = cfg.cell_size_degrees / 2
+    half = cell_size / 2
     for name in cell_names:
         try:
             lat_str, lon_str = name.split("_", 1)
@@ -989,8 +1480,10 @@ def _serialise(obj: Any) -> Any:
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating, float)):
-        if np.isnan(obj) or np.isinf(obj):
-            return None
+        if np.isnan(obj):
+            return "NaN"
+        if np.isinf(obj):
+            return "Inf" if obj > 0 else "-Inf"
         return float(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()

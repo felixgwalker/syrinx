@@ -143,13 +143,14 @@ def _extract_syllable(syl: dict[str, Any], cfg: Config) -> dict[str, Any]:
     win = int(sr * cfg.frame_length_ms / 1000.0)
 
     mfcc_vec, mfcc_temporal = _compute_mfcc_features(y, sr, cfg, hop, win)
-    pitch_amp_vec = _compute_pitch_amplitude_features(y, sr, cfg, hop, win)
+    pitch_amp_vec, fm_depth = _compute_pitch_amplitude_features(y, sr, cfg, hop, win)
 
     features = np.concatenate([mfcc_vec, pitch_amp_vec])
     assert features.shape == (36,), f"Expected 36 features, got {features.shape}"
 
     result = dict(syl)
     result["features"] = features
+    result["fm_depth_mean"] = fm_depth
     if cfg.use_temporal_features:
         result["mfcc_temporal"] = mfcc_temporal
     return result
@@ -313,7 +314,18 @@ def _compute_pitch_amplitude_features(
     else:
         decay_ms = float((len(rms) - peak_frame) * hop / sr * 1000.0)
 
-    return np.array(
-        [peak_freq, min_freq, freq_range, peak_amplitude, attack_ms, decay_ms],
-        dtype=np.float32,
+    # FM depth: mean absolute change in peak-frequency bin across spectrogram frames
+    # (instantaneous frequency modulation per RR §2.9.2)
+    if D.shape[1] > 1:
+        peak_freq_per_frame = freqs[np.argmax(D, axis=0)]
+        fm_depth = float(np.mean(np.abs(np.diff(peak_freq_per_frame))))
+    else:
+        fm_depth = 0.0
+
+    return (
+        np.array(
+            [peak_freq, min_freq, freq_range, peak_amplitude, attack_ms, decay_ms],
+            dtype=np.float32,
+        ),
+        fm_depth,
     )

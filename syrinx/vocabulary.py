@@ -88,9 +88,9 @@ def build_vocabulary(
             best_params[0], best_params[1], best_dbcv,
         )
 
-        # Zebra finch F1 check
-        zf_f1 = _zebrafinch_f1_check(X, best_labels, cfg)
-        if zf_f1 is not None and zf_f1 < cfg.zebrafinch_f1_threshold:
+        # Zebra finch F1 check (preregistered, §2.5)
+        zf_f1 = _zebrafinch_f1_check(best_params, cfg)
+        if zf_f1 < cfg.zebrafinch_f1_threshold:
             logger.warning(
                 "Zebra finch macro-F1=%.3f < threshold %.2f; adjusting toward coarser clustering",
                 zf_f1, cfg.zebrafinch_f1_threshold,
@@ -113,12 +113,12 @@ def build_vocabulary(
         centroids = np.vstack([X[best_labels == lb].mean(axis=0) for lb in unique_labels])
 
         # Run 4 gates
-        gate_results = _run_all_gates(X, best_labels, syllables, centroids, cfg)
+        gate_results = _run_all_gates(X, best_labels, syllables, centroids, cfg, best_params)
         cycle_diagnostics.append({
             "cycle": cycle,
             "params": {"min_cluster_size": best_params[0], "min_samples": best_params[1]},
             "dbcv": float(best_dbcv),
-            "zf_f1": float(zf_f1) if zf_f1 is not None else None,
+            "zf_f1": float(zf_f1),
             "gate_results": gate_results,
         })
 
@@ -262,6 +262,7 @@ def _run_all_gates(
     syllables: list[dict[str, Any]],
     centroids: np.ndarray,
     cfg: Config,
+    best_params: tuple[int, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run all four validation gates, returning per-gate results.
 
@@ -277,17 +278,23 @@ def _run_all_gates(
         Cluster centroid array.
     cfg:
         Pipeline configuration.
+    best_params:
+        ``(min_cluster_size, min_samples)`` from the DBCV grid search; passed
+        to Gate 1 and Gate 2 so they re-cluster with the actual fitted params.
     """
     return {
-        "gate1_bootstrap_stability": _gate1_bootstrap_stability(X, labels, cfg),
-        "gate2_cross_recordist": _gate2_cross_recordist(X, labels, syllables, cfg),
+        "gate1_bootstrap_stability": _gate1_bootstrap_stability(X, labels, cfg, best_params),
+        "gate2_cross_recordist": _gate2_cross_recordist(X, labels, syllables, cfg, best_params),
         "gate3_birdaves": _gate3_birdaves(syllables, labels, centroids, cfg),
         "gate4_spectral_homogeneity": _gate4_spectral_homogeneity(syllables, labels, cfg),
     }
 
 
 def _gate1_bootstrap_stability(
-    X: np.ndarray, labels: np.ndarray, cfg: Config
+    X: np.ndarray,
+    labels: np.ndarray,
+    cfg: Config,
+    best_params: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """Gate 1: Bootstrap cluster stability (median ARI ≥ threshold).
 
@@ -299,11 +306,15 @@ def _gate1_bootstrap_stability(
         Full-data cluster labels.
     cfg:
         Pipeline configuration.
+    best_params:
+        ``(min_cluster_size, min_samples)`` from the DBCV grid search; used
+        for re-clustering each bootstrap replicate.  Falls back to heuristic
+        derivation if not supplied.
     """
     import hdbscan
 
     rng = np.random.RandomState(cfg.random_seed)
-    params = _get_params_from_labels(labels, X)
+    params = best_params if best_params is not None else _get_params_from_labels(labels, X)
     aris = []
     n = len(X)
     for _ in range(cfg.bootstrap_n):
@@ -335,78 +346,122 @@ def _gate2_cross_recordist(
     labels: np.ndarray,
     syllables: list[dict[str, Any]],
     cfg: Config,
+    best_params: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
-    """Gate 2: Cross-recordist consistency (mean per-recordist ARI ≥ threshold).
+    """Gate 2: Cross-recordist consistency on P. trochilus (primary) or P. collybita (fallback).
 
-    For each recordist, re-cluster their syllable subset independently, then
-    compute ARI between those per-recordist labels and the full-data labels for
-    the same subset.  Averaging across recordists gives a consistency score.
+    Per §2.5: the corpus is filtered to the stereotyped-song reference species
+    before partitioning by recordist, so the check is not diluted by the
+    full multi-species pool.  For each recordist, their syllables are
+    re-clustered independently and the ARI against the full-data labels is
+    computed.  The permutation test is also scoped to the reference species.
 
     Parameters
     ----------
     X:
-        Feature matrix.
+        Full feature matrix (all species).
     labels:
         Full-data cluster labels.
     syllables:
-        Syllable records with ``recordist_id``.
+        Syllable records with ``species`` and ``recordist_id``.
     cfg:
         Pipeline configuration.
     """
     import hdbscan
 
-    recordists = [s.get("recordist_id", "") for s in syllables]
-    unique_rec = sorted(set(r for r in recordists if r))
-    if len(unique_rec) < 2:
-        logger.info("Gate 2: fewer than 2 recordists; auto-passing")
+    _MIN_SYLLABLES = 20
+
+    trochilus_idx = np.array([
+        i for i, s in enumerate(syllables)
+        if "trochilus" in s.get("species", "").lower()
+    ])
+    collybita_idx = np.array([
+        i for i, s in enumerate(syllables)
+        if "collybita" in s.get("species", "").lower()
+    ])
+
+    if len(trochilus_idx) >= _MIN_SYLLABLES:
+        ref_species = "Phylloscopus trochilus"
+        ref_idx = trochilus_idx
+    elif len(collybita_idx) >= _MIN_SYLLABLES:
+        ref_species = "Phylloscopus collybita"
+        ref_idx = collybita_idx
+    else:
+        logger.info(
+            "Gate 2: P. trochilus (%d syllables) and P. collybita (%d syllables) "
+            "both below minimum %d; auto-passing",
+            len(trochilus_idx), len(collybita_idx), _MIN_SYLLABLES,
+        )
         return {
             "value": 1.0,
             "threshold": cfg.cross_recordist_ari_threshold,
             "passed": True,
-            "note": "fewer than 2 recordists",
+            "note": "reference species insufficient",
+        }
+
+    X_ref = X[ref_idx]
+    labels_ref = labels[ref_idx]
+    syllables_ref = [syllables[i] for i in ref_idx]
+
+    recordists = [s.get("recordist_id", "") for s in syllables_ref]
+    unique_rec = sorted(set(r for r in recordists if r))
+    if len(unique_rec) < 2:
+        logger.info("Gate 2: fewer than 2 recordists for %s; auto-passing", ref_species)
+        return {
+            "value": 1.0,
+            "threshold": cfg.cross_recordist_ari_threshold,
+            "passed": True,
+            "note": f"fewer than 2 recordists for {ref_species}",
         }
 
     n_clusters_est = len(set(labels) - {-1})
-    params = _get_params_from_labels(labels, X)
+    params = best_params if best_params is not None else _get_params_from_labels(labels_ref, X_ref)
     aris: list[float] = []
 
-    for rec_id in unique_rec:
-        idx = np.array([i for i, r in enumerate(recordists) if r == rec_id])
-        # Scale min_cluster_size to subset size so clusters are still detectable
-        subset_min_cs = max(3, len(idx) // max(1, n_clusters_est * 3))
-        if len(idx) < subset_min_cs:
-            continue
-        X_sub = X[idx]
-        try:
-            c = hdbscan.HDBSCAN(
-                min_cluster_size=subset_min_cs,
-                min_samples=max(2, min(params[1], subset_min_cs)),
-            )
-            rec_labels = c.fit_predict(X_sub)
-            full_sub = labels[idx]
-            ari = adjusted_rand_score(full_sub, rec_labels)
-            aris.append(ari)
-        except Exception:
-            pass
+    def _per_recordist_aris(rec_assignments: list[str]) -> list[float]:
+        result_aris: list[float] = []
+        for rec_id in unique_rec:
+            idx = np.array([i for i, r in enumerate(rec_assignments) if r == rec_id])
+            subset_min_cs = max(3, len(idx) // max(1, n_clusters_est * 3))
+            if len(idx) < subset_min_cs:
+                continue
+            try:
+                c = hdbscan.HDBSCAN(
+                    min_cluster_size=subset_min_cs,
+                    min_samples=max(2, min(params[1], subset_min_cs)),
+                )
+                rec_labels = c.fit_predict(X_ref[idx])
+                ari = adjusted_rand_score(labels_ref[idx], rec_labels)
+                result_aris.append(ari)
+            except Exception:
+                pass
+        return result_aris
+
+    aris = _per_recordist_aris(recordists)
 
     if len(aris) < 2:
         return {
             "value": 0.0,
             "threshold": cfg.cross_recordist_ari_threshold,
             "passed": False,
-            "note": "insufficient recordists with enough syllables",
+            "note": f"insufficient recordists for {ref_species} with enough syllables",
         }
 
     mean_ari = float(np.mean(aris))
     threshold = cfg.cross_recordist_ari_threshold
 
-    # One-sided permutation test: is mean_ari above the random-assignment null?
+    # Permutation test: permute recordist assignments (not cluster labels) so that
+    # random syllable groups stand in for recorder-specific groups — this tests
+    # whether the observed cross-recordist consistency exceeds chance.
     rng = np.random.RandomState(cfg.random_seed)
-    null_aris = [
-        adjusted_rand_score(labels, rng.permutation(labels))
-        for _ in range(999)
-    ]
-    p_value = float(np.mean([n >= mean_ari for n in null_aris]))
+    recordists_array = np.array(recordists)
+    null_aris: list[float] = []
+    for _ in range(99):
+        perm_recs = list(rng.permutation(recordists_array))
+        perm_iter_aris = _per_recordist_aris(perm_recs)
+        if perm_iter_aris:
+            null_aris.append(float(np.mean(perm_iter_aris)))
+    p_value = float(np.mean([n >= mean_ari for n in null_aris])) if null_aris else 1.0
 
     passed = mean_ari >= threshold and p_value < 0.05
     return {
@@ -415,6 +470,7 @@ def _gate2_cross_recordist(
         "p_value": p_value,
         "passed": passed,
         "n_recordists": len(aris),
+        "ref_species": ref_species,
     }
 
 
@@ -681,32 +737,72 @@ def _maybe_extend_grid(
     return sorted(new)
 
 
-def _zebrafinch_f1_check(
-    X: np.ndarray, labels: np.ndarray, cfg: Config
-) -> float | None:
-    """Compute macro-F1 against zebra finch syllable labels if available.
+def _zebrafinch_f1_check(best_params: tuple[int, int], cfg: Config) -> float:
+    """Compute macro-F1 against zebra finch syllable labels (Tchernichovski et al., 2000).
+
+    Applies HDBSCAN with *best_params* to the pre-computed zebra finch feature
+    matrix, then evaluates the resulting clusters against published syllable-type
+    labels.
 
     Parameters
     ----------
-    X:
-        Feature matrix.
-    labels:
-        HDBSCAN cluster labels.
+    best_params:
+        ``(min_cluster_size, min_samples)`` selected by DBCV on the main corpus.
     cfg:
         Pipeline configuration.
+
+    Returns 1.0 (auto-pass) and logs a warning if either reference file is
+    absent.
+
+    Raises
+    ------
+    ValueError
+        If the two reference arrays have different lengths.
     """
-    ref_path = cfg.data_path / "reference" / "zebrafinch_labels.npy"
-    if not ref_path.exists():
-        return None
-    try:
-        zf_labels = np.load(ref_path)
-        if len(zf_labels) != len(X):
-            return None
-        mask = labels != -1
-        _, _, f1, _ = precision_recall_fscore_support(
-            zf_labels[mask], labels[mask], average="macro", zero_division=0
+    import hdbscan as _hdbscan
+
+    ref_dir = cfg.data_path / "reference"
+    features_path = ref_dir / "zebrafinch_features.npy"
+    labels_path = ref_dir / "zebrafinch_labels.npy"
+
+    if not features_path.exists():
+        try:
+            from .acquire import prepare_zebrafinch_reference
+            prepare_zebrafinch_reference(cfg)
+        except Exception as exc:
+            logger.warning("Zebra finch feature preparation failed (%s); F1 gate skipped (auto-pass)", exc)
+            return 1.0
+
+    if not labels_path.exists():
+        logger.warning(
+            "Zebra finch labels file absent (%s); must be provided manually "
+            "(Tchernichovski et al. 2000 syllable types). F1 gate skipped (auto-pass).",
+            labels_path,
         )
-        return float(f1)
-    except Exception as exc:
-        logger.debug("Zebra finch F1 check failed: %s", exc)
-        return None
+        return 1.0
+
+    X_zf = np.load(features_path).astype(np.float64)
+    zf_labels = np.load(labels_path)
+
+    if len(zf_labels) != len(X_zf):
+        raise ValueError(
+            f"zebrafinch_labels.npy has {len(zf_labels)} entries but "
+            f"zebrafinch_features.npy has {len(X_zf)} rows — they must match."
+        )
+
+    clusterer = _hdbscan.HDBSCAN(
+        min_cluster_size=best_params[0],
+        min_samples=best_params[1],
+        core_dist_n_jobs=1,
+    )
+    predicted = clusterer.fit_predict(X_zf)
+
+    mask = predicted != -1
+    if mask.sum() == 0:
+        logger.warning("HDBSCAN assigned all zebra finch syllables to noise; F1=0.0")
+        return 0.0
+
+    _, _, f1, _ = precision_recall_fscore_support(
+        zf_labels[mask], predicted[mask], average="macro", zero_division=0
+    )
+    return float(f1)

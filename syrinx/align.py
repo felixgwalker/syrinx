@@ -12,7 +12,7 @@ import numpy as np
 from scipy.stats import binomtest
 
 from .config import Config
-from .utils import save_array
+from .utils import save_array, upper_triangle
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +115,75 @@ def align_all(
             diag,
         )
 
-    # Recording-level bootstrap
+    # Recording-level bootstrap (returns per-entry CIs + per-replicate acoustic vectors)
     bootstrap_cis = _recording_bootstrap(
         syllables, labels_array, cluster_letters, cfg, aligner,
         entities, song_strings, dataset
     )
+
+    # Cell-size sensitivity matrices (within_species only, Item 5)
+    h3_cell_size_sensitivity: dict[str, Any] = {}
+    h3_length_sensitivity: dict[str, Any] = {}
+    if dataset == "within_species" and entities:
+        for cell_size in cfg.h3_cell_size_sensitivity_degrees:
+            key = str(cell_size)
+            if abs(cell_size - cfg.cell_size_degrees) < 1e-9:
+                h3_cell_size_sensitivity[key] = {
+                    "entities": entities,
+                    "distance_matrix": D_all,
+                    "n_cells": len(entities),
+                    "cell_size_degrees": cell_size,
+                }
+            else:
+                ents_s, strings_s = _build_cell_strings(
+                    syllables, labels_array, cluster_letters, cfg,
+                    cell_size=cell_size,
+                )
+                if len(ents_s) >= 3:
+                    _, D_s = _pairwise_distance_matrix(
+                        {sp: strings_s[sp] for sp in ents_s}, aligner
+                    )
+                    h3_cell_size_sensitivity[key] = {
+                        "entities": ents_s,
+                        "distance_matrix": D_s,
+                        "n_cells": len(ents_s),
+                        "cell_size_degrees": cell_size,
+                    }
+                else:
+                    h3_cell_size_sensitivity[key] = {
+                        "n_cells": len(ents_s),
+                        "cell_size_degrees": cell_size,
+                        "insufficient_cells": True,
+                    }
+
+        # String-length sensitivity matrices (within_species only, Item 6)
+        for frac in cfg.cell_length_sensitivity_fractions:
+            key = str(frac)
+            if abs(frac - 1.0) < 1e-9:
+                h3_length_sensitivity[key] = {
+                    "entities": entities,
+                    "distance_matrix": D_all,
+                    "truncate_fraction": frac,
+                }
+            else:
+                ents_f, strings_f = _build_cell_strings(
+                    syllables, labels_array, cluster_letters, cfg,
+                    truncate_fraction=frac,
+                )
+                if len(ents_f) >= 3:
+                    _, D_f = _pairwise_distance_matrix(
+                        {sp: strings_f[sp] for sp in ents_f}, aligner
+                    )
+                    h3_length_sensitivity[key] = {
+                        "entities": ents_f,
+                        "distance_matrix": D_f,
+                        "truncate_fraction": frac,
+                    }
+                else:
+                    h3_length_sensitivity[key] = {
+                        "truncate_fraction": frac,
+                        "insufficient_cells": True,
+                    }
 
     # Noise floors
     noise_floors = _compute_noise_floors(syllables, labels_array, cluster_letters, aligner, cfg)
@@ -144,6 +208,8 @@ def align_all(
         "noise_floors": noise_floors,
         "nominate_only_distance_matrix": D_nom,
         "nominate_entities": sorted(nominate_strings.keys()) if nominate_strings else [],
+        "h3_cell_size_sensitivity": h3_cell_size_sensitivity,
+        "h3_length_sensitivity": h3_length_sensitivity,
     }
 
 
@@ -177,7 +243,6 @@ def _build_species_strings(
         species_seqs.setdefault(sp, []).append(letter)
 
     sorted_species = sorted(species_seqs.keys())
-    strings = {"".join(species_seqs[sp]): sp for sp in sorted_species}
     return sorted_species, {sp: "".join(species_seqs[sp]) for sp in sorted_species}
 
 
@@ -186,26 +251,37 @@ def _build_cell_strings(
     labels_array: np.ndarray,
     cluster_letters: dict[int, str],
     cfg: Config,
+    cell_size: float | None = None,
+    truncate_fraction: float = 1.0,
 ) -> tuple[list[str], dict[str, str]]:
     """Build per-geographic-cell song strings for within-species analysis.
 
-    Strings are truncated to the shortest qualifying cell length
-    (rounded to multiple of 10 syllables).
+    Cells are qualified by the number of *distinct recordings* (xc_id) they
+    contain, not by raw syllable count.  Truncation is to the minimum-cell
+    syllable total (×10 multiple, scaled by ``truncate_fraction``) by
+    sampling *whole recordings* in a random order — no mid-recording cuts.
 
     Parameters
     ----------
     syllables:
-        Syllable records with ``lat`` and ``lon``.
+        Syllable records with ``lat``, ``lon``, and ``xc_id``.
     labels_array:
         Cluster label per syllable.
     cluster_letters:
         Label-to-letter mapping.
     cfg:
         Pipeline configuration.
+    cell_size:
+        Cell edge length in degrees (defaults to ``cfg.cell_size_degrees``).
+    truncate_fraction:
+        Fraction of the min-cell syllable count to target; 1.0 = 100%.
     """
+    if cell_size is None:
+        cell_size = cfg.cell_size_degrees
+
     rng = random.Random(cfg.random_seed)
-    cell_seqs: dict[str, list[str]] = {}
-    half = cfg.cell_size_degrees / 2
+    # cell_id → {xc_id → [letters]}
+    cell_recs: dict[str, dict[str, list[str]]] = {}
 
     for i, syl in enumerate(syllables):
         lb = labels_array[i]
@@ -215,34 +291,46 @@ def _build_cell_strings(
         lon = syl.get("lon")
         if lat is None or lon is None:
             continue
-        cell_lat = round(int(lat / cfg.cell_size_degrees) * cfg.cell_size_degrees, 4)
-        cell_lon = round(int(lon / cfg.cell_size_degrees) * cfg.cell_size_degrees, 4)
+        cell_lat = round(int(lat / cell_size) * cell_size, 4)
+        cell_lon = round(int(lon / cell_size) * cell_size, 4)
         cell_id = f"{cell_lat:.2f}_{cell_lon:.2f}"
+        xc_id = syl.get("xc_id", f"rec_{i}")
         letter = cluster_letters[lb]
-        cell_seqs.setdefault(cell_id, []).append(letter)
+        cell_recs.setdefault(cell_id, {}).setdefault(xc_id, []).append(letter)
 
-    # Keep only qualifying cells
+    # Qualify by distinct recording count (not syllable count)
     qualified = {
-        cell: seq for cell, seq in cell_seqs.items()
-        if len(seq) >= cfg.min_recordings_per_cell
+        cell: recs for cell, recs in cell_recs.items()
+        if len(recs) >= cfg.min_recordings_per_cell
     }
 
     if not qualified:
         return [], {}
 
-    # Truncate to shortest cell (multiple of 10)
-    min_len = min(len(seq) for seq in qualified.values())
-    truncate_to = (min_len // 10) * 10
-    if truncate_to == 0:
-        truncate_to = min_len
+    # Truncation target: min total syllables across qualified cells, ×10
+    # multiple, scaled by the requested fraction.
+    total_per_cell = {
+        cell: sum(len(s) for s in recs.values())
+        for cell, recs in qualified.items()
+    }
+    min_len = min(total_per_cell.values())
+    base_truncate = (min_len // 10) * 10 or min_len
+    truncate_to = max(1, int(base_truncate * truncate_fraction))
+    if truncate_to > 10:
+        truncate_to = (truncate_to // 10) * 10
 
     result: dict[str, str] = {}
-    for cell, seq in qualified.items():
-        if len(seq) > truncate_to:
-            sampled = rng.sample(seq, truncate_to)
-        else:
-            sampled = seq[:truncate_to]
-        result[cell] = "".join(sampled)
+    for cell, recs in qualified.items():
+        rec_ids = list(recs.keys())
+        # Randomly shuffle recordings; concatenate whole recordings until we
+        # reach truncate_to (no mid-recording cut).
+        shuffled = rng.sample(rec_ids, len(rec_ids))
+        accumulated: list[str] = []
+        for rec_id in shuffled:
+            accumulated.extend(recs[rec_id])
+            if len(accumulated) >= truncate_to:
+                break
+        result[cell] = "".join(accumulated)
 
     sorted_cells = sorted(result.keys())
     return sorted_cells, result
@@ -484,6 +572,7 @@ def _run_null_model(
         "proportion_above": proportion_above,
         "binomial_p": p_value,
         "threshold_alpha": cfg.null_model_binomial_alpha,
+        "upper_tail": upper_tail,
         "percentile_ranks": percentile_ranks,
     }
 
@@ -542,15 +631,25 @@ def _recording_bootstrap(
     n = len(entities)
     bootstrap_distances = np.zeros((cfg.recording_bootstrap_n, n, n))
 
-    # Group syllables by entity (species or cell) and recording
+    # Group syllables by entity (species for genus; cell ID for within_species) and recording
     entity_recordings: dict[str, dict[str, list[int]]] = {}
     for i, syl in enumerate(syllables):
         lb = labels_array[i]
         if lb == -1:
             continue
-        sp = syl.get("species", "unknown")
+        if dataset == "within_species":
+            cell_size = cfg.cell_size_degrees
+            lat = syl.get("lat")
+            lon = syl.get("lon")
+            if lat is None or lon is None:
+                continue
+            cell_lat = round(int(float(lat) / cell_size) * cell_size, 4)
+            cell_lon = round(int(float(lon) / cell_size) * cell_size, 4)
+            entity_key = f"{cell_lat:.2f}_{cell_lon:.2f}"
+        else:
+            entity_key = syl.get("species", "unknown")
         rec_id = syl.get("xc_id", f"rec_{i}")
-        entity_recordings.setdefault(sp, {}).setdefault(rec_id, []).append(i)
+        entity_recordings.setdefault(entity_key, {}).setdefault(rec_id, []).append(i)
 
     for b in range(cfg.recording_bootstrap_n):
         boot_strings: dict[str, str] = {}
@@ -577,7 +676,15 @@ def _recording_bootstrap(
 
     lo = np.percentile(bootstrap_distances, 2.5, axis=0)
     hi = np.percentile(bootstrap_distances, 97.5, axis=0)
-    return {"ci_lower": lo, "ci_upper": hi}
+
+    # Per-replicate upper-triangle acoustic vectors; used in inference.py to
+    # compute the bootstrap 95% CI on the MRM partial coefficient (Item 3).
+    boot_acoustic_vecs = [
+        upper_triangle(bootstrap_distances[b]).tolist()
+        for b in range(cfg.recording_bootstrap_n)
+    ]
+
+    return {"ci_lower": lo, "ci_upper": hi, "bootstrap_acoustic_vecs": boot_acoustic_vecs}
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +750,16 @@ def _compute_noise_floors(
     result = {
         "strict_mean": None,
         "strict_p95": None,
+        # Strict (within-individual) noise floor requires the same bird recorded
+        # twice independently on the same day.  Xeno-canto assigns one xc_id per
+        # recording session but does not guarantee individual identity across
+        # sessions, so this value cannot be computed from public archive data.
+        "strict_unavailable_reason": (
+            "Within-individual noise floor requires confirmed individual identity "
+            "across separate recording sessions.  Xeno-canto does not track "
+            "individual birds across xc_ids, so strict_mean/strict_p95 are always "
+            "unavailable when using public Xeno-canto data."
+        ),
         "lenient_mean": float(np.mean(lenient_dists)) if lenient_dists else None,
         "lenient_p95": float(np.percentile(lenient_dists, 95)) if lenient_dists else None,
     }
@@ -700,10 +817,10 @@ def _make_figure_3(null_result: dict[str, Any], cfg: Config) -> None:
         annotation_position="top right",
     )
     fig.add_vline(
-        x=null_result.get("threshold_alpha", 0.025),
+        x=null_result.get("upper_tail", cfg.null_model_upper_tail),
         line_dash="dot",
         line_color="orange",
-        annotation_text="97.5th-pct tail",
+        annotation_text=f"{null_result.get('upper_tail', cfg.null_model_upper_tail) * 100:.1f}th-pct tail",
         annotation_position="top left",
     )
     fig.update_layout(

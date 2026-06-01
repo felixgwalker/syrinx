@@ -33,6 +33,9 @@ h3_biological_threshold_mantel_r: 0.20
 cell_size_degrees: 0.5
 min_recordings_per_cell: 5
 min_cells_for_inference: 6
+h3_cell_size_sensitivity_degrees: [0.25, 0.5, 1.0]
+cell_length_sensitivity_fractions: [1.0, 0.75, 0.5]
+avonet_data_path: "data/avonet_traits.csv"
 use_temporal_features: false
 breeding_window_palearctic: [4, 7]
 breeding_window_asian: [5, 8]
@@ -90,3 +93,4 @@ bbs_regions:
   - "England-N"
 
 bbs_scotland_lat_threshold: 55.0
+max_syllables_pairwise_distance: 100

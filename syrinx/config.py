@@ -64,6 +64,8 @@ class Config:
     # Preregistered feature aggregation (see RR §2.9.1 and RR-AMBIGUITY resolution 2026-05-31).
     # "mean" is the only reading consistent with stated 30/36-dim counts; do not change without
     # updating mfcc_feature_dim, pitch_amplitude_dim, and all downstream dimension constants.
+    zebrafinch_xc_cap: int = 20
+
     cepstral_aggregation: str = "mean"
 
     xc_query_genus: str = "gen:Phylloscopus type:song q:A"
@@ -92,6 +94,10 @@ class Config:
         "England-SE", "England-SW", "England-Midlands", "England-N",
     ])
     bbs_scotland_lat_threshold: float = 55.0
+    h3_cell_size_sensitivity_degrees: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0])
+    cell_length_sensitivity_fractions: list[float] = field(default_factory=lambda: [1.0, 0.75, 0.5])
+    avonet_data_path: str = "data/avonet_traits.csv"
+    max_syllables_pairwise_distance: int = 100
 
     _raw: dict[str, Any] = field(default_factory=dict, repr=False)
 

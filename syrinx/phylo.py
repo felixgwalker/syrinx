@@ -62,9 +62,30 @@ def reconstruct_trees(
     (tree_dir / "acoustic_nj.nwk").write_text(nj_newick)
     logger.info("Saved acoustic trees to %s", tree_dir)
 
-    # Topological agreement
-    rf, quartet, ms = _compute_tree_agreement(upgma_tree, nj_tree)
-    method_stability = _null_model_tree_agreement(D, species_names, rf, quartet, ms, cfg)
+    # Topological agreement (see metric_approximation_note below)
+    rf, unweighted_rf_norm, weighted_rf_norm = _compute_tree_agreement(upgma_tree, nj_tree)
+    method_stability = _null_model_tree_agreement(
+        D, species_names, rf, unweighted_rf_norm, weighted_rf_norm, cfg
+    )
+
+    # Nominate-only trees (Item 4)
+    D_nom = alignment_result.get("nominate_only_distance_matrix")
+    nominate_entities = alignment_result.get("nominate_entities", [])
+    nominate_result: dict[str, Any] = {}
+    if D_nom is not None and len(nominate_entities) >= 3:
+        upgma_nom, nj_nom = _build_trees(D_nom, nominate_entities)
+        (tree_dir / "acoustic_upgma_nominate.nwk").write_text(_tree_to_newick(upgma_nom))
+        (tree_dir / "acoustic_nj_nominate.nwk").write_text(_tree_to_newick(nj_nom))
+        rf_nom, uwrf_nom, wrf_nom = _compute_tree_agreement(upgma_nom, nj_nom)
+        nominate_result = {
+            "upgma_newick": _tree_to_newick(upgma_nom),
+            "nj_newick": _tree_to_newick(nj_nom),
+            "rf_distance": rf_nom,
+            "unweighted_rf_normalized": uwrf_nom,
+            "weighted_rf_normalized": wrf_nom,
+            "n_species": len(nominate_entities),
+        }
+        logger.info("Nominate-only trees saved (n=%d species)", len(nominate_entities))
 
     # Load reference molecular trees
     reference_trees = _load_reference_trees(cfg)
@@ -80,10 +101,21 @@ def reconstruct_trees(
         "upgma_newick": upgma_newick,
         "nj_newick": nj_newick,
         "rf_distance": rf,
-        "quartet_distance": quartet,
-        "ms_distance": ms,
+        # Renamed from quartet_distance / ms_distance (Item 7).  These are
+        # dendropy RF variants, not true quartet or matching-split distances.
+        # See metric_approximation_note.
+        "unweighted_rf_normalized": unweighted_rf_norm,
+        "weighted_rf_normalized": weighted_rf_norm,
+        "metric_approximation_note": (
+            "unweighted_rf_normalized uses dendropy symmetric_difference / (2*(n-3)); "
+            "weighted_rf_normalized uses dendropy weighted_robinson_foulds_distance / n_taxa. "
+            "Neither is a true quartet distance nor a true matching-split distance. "
+            "tqdist is not available in this environment. "
+            "This limitation should be noted in the supplement."
+        ),
         "method_stability": method_stability,
         "reference_trees": reference_trees,
+        "nominate_only_trees": nominate_result,
     }
 
     if run_log is not None:
@@ -148,17 +180,22 @@ def _tree_to_newick(tree: Any) -> str:
 def _compute_tree_agreement(
     tree1: Any, tree2: Any
 ) -> tuple[float, float, float]:
-    """Compute RF, quartet, and matching split distances between two trees.
-
-    Parameters
-    ----------
-    tree1, tree2:
-        Bio.Phylo tree objects.
+    """Compute RF and two RF-variant distances between two trees.
 
     Returns
     -------
     tuple[float, float, float]
-        ``(rf, quartet, matching_split)`` — all normalised to [0, 1].
+        ``(rf_norm, unweighted_rf_normalized, weighted_rf_normalized)``
+
+    Notes
+    -----
+    These are *not* true quartet distance or matching-split distance despite
+    earlier labelling.  ``unweighted_rf_normalized`` wraps
+    ``dendropy.symmetric_difference / (2*(n-3))`` and
+    ``weighted_rf_normalized`` wraps
+    ``dendropy.weighted_robinson_foulds_distance / n_taxa``.
+    tqdist is not available in this environment; see metric_approximation_note
+    in the ``reconstruct_trees`` output for the supplement caveat.
     """
     try:
         import dendropy
@@ -177,24 +214,24 @@ def _compute_tree_agreement(
         rf_raw = treecompare.symmetric_difference(dt1, dt2)
         rf_norm = rf_raw / (2 * (n_taxa - 3)) if n_taxa > 3 else 0.0
 
-        # Quartet distance approximation
         try:
-            qd = treecompare.unweighted_robinson_foulds_distance(dt1, dt2)
-            quartet = float(qd) / max(1, n_taxa)
+            uwrf = treecompare.unweighted_robinson_foulds_distance(dt1, dt2)
+            unweighted_rf_norm = float(uwrf) / max(1, n_taxa)
         except Exception:
-            quartet = rf_norm
+            unweighted_rf_norm = rf_norm
 
-        # Matching split distance
         try:
-            ms = treecompare.weighted_robinson_foulds_distance(dt1, dt2)
-            ms = float(ms) / max(1, n_taxa)
+            wrf = treecompare.weighted_robinson_foulds_distance(dt1, dt2)
+            weighted_rf_norm = float(wrf) / max(1, n_taxa)
         except Exception:
-            ms = rf_norm
+            weighted_rf_norm = rf_norm
 
-        return float(rf_norm), float(quartet), float(ms)
+        return float(rf_norm), float(unweighted_rf_norm), float(weighted_rf_norm)
     except ImportError:
-        logger.warning("dendropy not installed; returning placeholder distances")
-        return 0.5, 0.5, 0.5
+        raise ImportError(
+            "dendropy is required for tree distance calculations. "
+            "Install it with: pip install dendropy"
+        ) from None
     except Exception as exc:
         logger.warning("Tree comparison failed: %s", exc)
         return float("nan"), float("nan"), float("nan")
@@ -204,8 +241,8 @@ def _null_model_tree_agreement(
     D: np.ndarray,
     names: list[str],
     obs_rf: float,
-    obs_quartet: float,
-    obs_ms: float,
+    obs_unweighted_rf_norm: float,
+    obs_weighted_rf_norm: float,
     cfg: Config,
 ) -> dict[str, Any]:
     """Null model for topological agreement by shuffling the distance matrix.
@@ -216,38 +253,42 @@ def _null_model_tree_agreement(
         Observed distance matrix.
     names:
         Entity names.
-    obs_rf, obs_quartet, obs_ms:
-        Observed distance values.
+    obs_rf:
+        Observed normalised RF distance.
+    obs_unweighted_rf_norm:
+        Observed unweighted-RF-normalised value.
+    obs_weighted_rf_norm:
+        Observed weighted-RF-normalised value.
     cfg:
         Pipeline configuration.
     """
     rng = np.random.RandomState(cfg.random_seed)
     n = len(names)
     null_rfs: list[float] = []
-    null_quartets: list[float] = []
-    null_ms: list[float] = []
+    null_uwrf: list[float] = []
+    null_wrf: list[float] = []
 
     for _ in range(cfg.rf_null_permutations):
         perm = rng.permutation(n)
         D_perm = D[np.ix_(perm, perm)]
         try:
             t1, t2 = _build_trees(D_perm, names)
-            rf, q, ms = _compute_tree_agreement(t1, t2)
+            rf, uwrf, wrf = _compute_tree_agreement(t1, t2)
             null_rfs.append(rf)
-            null_quartets.append(q)
-            null_ms.append(ms)
+            null_uwrf.append(uwrf)
+            null_wrf.append(wrf)
         except Exception:
             pass
 
     def percentile_rank(obs: float, null: list[float]) -> float:
         if not null:
             return float("nan")
-        return float(np.mean([n <= obs for n in null]))
+        return float(np.mean([v <= obs for v in null]))
 
     return {
         "rf_percentile_rank": percentile_rank(obs_rf, null_rfs),
-        "quartet_percentile_rank": percentile_rank(obs_quartet, null_quartets),
-        "ms_percentile_rank": percentile_rank(obs_ms, null_ms),
+        "unweighted_rf_percentile_rank": percentile_rank(obs_unweighted_rf_norm, null_uwrf),
+        "weighted_rf_percentile_rank": percentile_rank(obs_weighted_rf_norm, null_wrf),
         "n_null": len(null_rfs),
         "interpretation": {
             "lower_5pct": "stable signal (method-insensitive)",
